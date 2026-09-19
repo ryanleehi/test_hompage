@@ -1,0 +1,17 @@
+# 런타임 데이터 (기기 토큰/예약 내역/스냅샷 - 저장소에 올리지 않음)
+clients.csv
+reservations.csv
+snapshots/
+*.tmp
+
+# 큰 모델 파일 (36MB, server.py 가 시작 시 자동 다운로드)
+models/object_detection_yolox_2022nov.onnx
+
+# Python / IDE / OS
+__pycache__/
+*.pyc
+.claude/
+.DS_Store
+
+# Arduino IDE 가 만든 사본
+meetingroom_esp32_s3_cam_copy_*/

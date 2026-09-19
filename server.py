@@ -1,0 +1,1079 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+회의실 예약 / 재실 감지 서버
+============================
+
+ESP32-S3-CAM 클라이언트(esp32-s3-cam-meetingroom.ino)와 연동되는 Flask 서버.
+
+  - 접속하는 클라이언트의 MAC / IP / 회의실명을 clients.csv 에 저장
+  - 클라이언트마다 인증코드를 발급하고, 클라이언트 웹페이지에서 입력한 코드를 검증해 토큰 발급
+  - 인증된 클라이언트의 재실 상태(heartbeat)와 블러 처리된 스냅샷 수신
+  - 회의실 예약: 회의 목적 / 예약자명, 08:00 ~ 20:00 를 30분 단위로 예약 (reservations.csv)
+  - 대시보드(/): 회의실 상태 + 좌우로 이동 가능한 시간 막대로 예약
+  - 관리자(/admin): 클라이언트 목록 / 인증코드 확인 / 회의실명 확인·수정 / 인증 취소
+
+실행:
+    pip install flask
+    python server.py                 # http://0.0.0.0:5000
+    PORT=8080 ADMIN_PASSWORD=secret python server.py   # 포트 변경, 관리자 페이지 비밀번호
+"""
+
+import csv
+import os
+import secrets
+import threading
+import time
+import uuid
+from datetime import datetime, date
+
+from flask import (Flask, Response, abort, jsonify, redirect, render_template_string,
+                   request, url_for)
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CLIENTS_CSV = os.path.join(BASE_DIR, "clients.csv")
+RESERVATIONS_CSV = os.path.join(BASE_DIR, "reservations.csv")
+SNAPSHOT_DIR = os.path.join(BASE_DIR, "snapshots")
+
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "5000"))
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")   # 비어 있으면 /admin 인증 없음
+
+OPEN_HOUR, CLOSE_HOUR, SLOT_MIN = 8, 20, 30   # 08:00 ~ 20:00, 30분 단위
+OFFLINE_AFTER_SEC = 30                        # heartbeat 가 이 시간 이상 없으면 오프라인
+PRESENCE_HOLD_SEC = 30                        # 서버가 스냅샷에서 사람을 찾은 뒤 "재실" 유지 시간 (보드의 PRESENCE_HOLD_MS 와 동일)
+MAX_AUTH_FAILS = 5                            # 연속 실패 시 인증코드 재발급
+
+CLIENT_FIELDS = ["mac", "ip", "room", "auth_code", "authorized", "token",
+                 "first_seen", "last_seen", "fail_count"]
+RES_FIELDS = ["id", "room", "date", "start", "end", "purpose", "reserver", "created_at"]
+
+# ---------------------------------------------------------------------------
+# 서버측 얼굴 블러 안전장치 (선택):  pip install opencv-python-headless numpy
+#   기기에서 얼굴 감지가 꺼져 있거나(PSRAM 없음) 놓친 얼굴이 있어도 서버에서 한 번 더 블러 처리.
+#   OpenCV 의 DNN 얼굴 검출기(YuNet)를 사용하고, 모델 파일(약 230KB)은 models/ 에 없으면 시작 시 내려받음.
+#   SERVER_BLUR=0 으로 실행하면 끔.
+# ---------------------------------------------------------------------------
+SERVER_BLUR = os.environ.get("SERVER_BLUR", "1") != "0"     # 스냅샷 모자이크 처리
+SERVER_DETECT = os.environ.get("SERVER_DETECT", "1") != "0" # 스냅샷에서 사람/얼굴 검출 -> 재실 판정 (블러와 별개로 동작)
+BLUR_MODE = os.environ.get("BLUR_MODE", "person")          # person: 사람 전체 모자이크 / face: 얼굴만
+PERSON_CONF = float(os.environ.get("PERSON_CONF", "0.3"))  # YOLOX 사람 검출 신뢰도 임계값 (낮출수록 민감)
+MODEL_DIR = os.path.join(BASE_DIR, "models")
+YUNET_FILE = os.path.join(MODEL_DIR, "face_detection_yunet_2023mar.onnx")
+YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+HAVE_CV2 = False
+_yunet = None
+_yunet_lock = threading.Lock()
+_cascades = []
+_hog = None                 # HOG 보행자 검출기 (OpenCV 4.x 폴백)
+_hog_lock = threading.Lock()
+_yolox = None               # YOLOX 사람 검출기 (DNN, opencv_zoo) - 얼굴이 안 보이는/돌아선/앉은 사람도 잡음
+_yolox_lock = threading.Lock()
+YOLOX_FILE = os.path.join(MODEL_DIR, "object_detection_yolox_2022nov.onnx")
+YOLOX_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/object_detection_yolox/object_detection_yolox_2022nov.onnx"
+YOLOX_SIZE = 640
+try:
+    import cv2
+    import numpy as np
+    HAVE_CV2 = True
+except Exception:  # noqa: BLE001
+    cv2 = None
+    np = None
+
+
+def _download(url, dest, min_size):
+    """모델 파일 다운로드 (urllib 실패 시 시스템 curl 로 재시도). 성공 여부 반환"""
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    print("모델 다운로드 중: %s" % url, flush=True)
+    tmp = dest + ".tmp"
+    try:
+        import urllib.request
+        urllib.request.urlretrieve(url, tmp)
+    except Exception as e:  # noqa: BLE001
+        # python.org 배포판 Python 은 루트 인증서가 없어 SSL 검증에 실패하는 경우가 많음 -> 시스템 curl 로 재시도
+        import subprocess
+        r = subprocess.run(["curl", "-sSL", "--max-time", "120", "-o", tmp, url])
+        if r.returncode != 0:
+            print("모델 다운로드 실패 (%s). %s 를 직접 받아 %s 에 넣어주세요" % (e, url, dest), flush=True)
+    if os.path.exists(tmp) and os.path.getsize(tmp) > min_size:
+        os.replace(tmp, dest)
+        return True
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    return False
+
+
+def init_face_detector():
+    """YuNet(DNN) 우선, 없으면 Haar 캐스케이드. 둘 다 없으면 서버측 블러 비활성."""
+    global _yunet, _cascades, HAVE_CV2
+    if not (HAVE_CV2 and (SERVER_BLUR or SERVER_DETECT)):
+        return
+    if not os.path.exists(YUNET_FILE):
+        _download(YUNET_URL, YUNET_FILE, 100000)
+    if os.path.exists(YUNET_FILE) and hasattr(cv2, "FaceDetectorYN"):
+        try:
+            _yunet = cv2.FaceDetectorYN.create(YUNET_FILE, "", (320, 240), 0.6, 0.3, 500)
+            return
+        except Exception as e:  # noqa: BLE001
+            print("YuNet 초기화 실패: %s" % e, flush=True)
+    # 폴백: Haar 캐스케이드 (OpenCV 4.x 패키지에 포함, 5.x 에는 없음)
+    try:
+        for f in ("haarcascade_frontalface_default.xml", "haarcascade_profileface.xml"):
+            path = os.path.join(cv2.data.haarcascades, f)
+            if os.path.exists(path):
+                c = cv2.CascadeClassifier(path)
+                if not c.empty():
+                    _cascades.append(c)
+    except Exception:  # noqa: BLE001
+        pass
+    if not _cascades:
+        HAVE_CV2 = False
+
+
+def init_person_detector():
+    """사람(전신/상반신) 검출기: YOLOX(DNN, 36MB) 우선, 없으면 HOG(OpenCV 4.x). 얼굴 기준 확장만으로도 동작은 함"""
+    global _hog, _yolox
+    if not (HAVE_CV2 and (SERVER_DETECT or (SERVER_BLUR and BLUR_MODE == "person"))):
+        return
+    if not os.path.exists(YOLOX_FILE):
+        _download(YOLOX_URL, YOLOX_FILE, 10000000)
+    if os.path.exists(YOLOX_FILE):
+        try:
+            _yolox = cv2.dnn.readNet(YOLOX_FILE)
+            return
+        except Exception as e:  # noqa: BLE001
+            print("YOLOX 초기화 실패: %s" % e, flush=True)
+            _yolox = None
+    if hasattr(cv2, "HOGDescriptor"):
+        try:
+            _hog = cv2.HOGDescriptor()
+            _hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        except Exception as e:  # noqa: BLE001
+            print("HOG 보행자 검출기 초기화 실패: %s" % e, flush=True)
+            _hog = None
+
+
+def _detect_faces(img):
+    """BGR 이미지에서 얼굴 사각형 [(x, y, w, h), ...] 반환"""
+    h, w = img.shape[:2]
+    if _yunet is not None:
+        with _yunet_lock:                        # FaceDetectorYN 은 스레드 안전하지 않음
+            _yunet.setInputSize((w, h))
+            _, faces = _yunet.detect(img)
+        if faces is None:
+            return []
+        return [(int(f[0]), int(f[1]), int(f[2]), int(f[3])) for f in faces]
+    gray = cv2.equalizeHist(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+    found = []
+    for cas in _cascades:
+        for flip in (False, True):               # 프로파일 캐스케이드는 한쪽 방향만 잡으므로 좌우 반전도 검사
+            g = cv2.flip(gray, 1) if flip else gray
+            for (x, y, fw, fh) in cas.detectMultiScale(g, 1.1, 4, minSize=(max(16, w // 20),) * 2):
+                found.append((int(w - x - fw) if flip else int(x), int(y), int(fw), int(fh)))
+    return found
+
+
+def _face_to_person(x, y, fw, fh, W, H):
+    """얼굴 사각형을 사람(머리~상반신/하반신) 영역으로 확장. 얼굴 폭의 약 4배, 얼굴 높이의 약 7배"""
+    cx = x + fw / 2.0
+    x1, x2 = cx - 2.0 * fw, cx + 2.0 * fw
+    y1, y2 = y - 0.7 * fh, y + fh + 5.5 * fh
+    return (max(0, int(x1)), max(0, int(y1)), min(W, int(x2)), min(H, int(y2)))
+
+
+_yolox_grids = None
+
+
+def _yolox_decode_tables():
+    global _yolox_grids
+    if _yolox_grids is None:
+        grids, strides = [], []
+        for st in (8, 16, 32):
+            n = YOLOX_SIZE // st
+            yv, xv = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
+            grids.append(np.stack((xv, yv), -1).reshape(-1, 2))
+            strides.append(np.full((n * n, 1), st))
+        _yolox_grids = (np.concatenate(grids), np.concatenate(strides))
+    return _yolox_grids
+
+
+def _detect_people(img, conf=None):
+    conf = PERSON_CONF if conf is None else conf
+    """사람 사각형 [(x1, y1, x2, y2), ...] 반환. YOLOX(COCO person) 또는 HOG 폴백"""
+    H, W = img.shape[:2]
+    if _yolox is not None:
+        # letterbox -> 640x640
+        r = min(YOLOX_SIZE / H, YOLOX_SIZE / W)
+        rs = cv2.resize(img, (max(1, int(W * r)), max(1, int(H * r))))
+        pad = np.full((YOLOX_SIZE, YOLOX_SIZE, 3), 114, np.uint8)
+        pad[:rs.shape[0], :rs.shape[1]] = rs
+        blob = cv2.dnn.blobFromImage(pad, 1.0, (YOLOX_SIZE, YOLOX_SIZE), swapRB=True)
+        with _yolox_lock:
+            _yolox.setInput(blob)
+            out = _yolox.forward()[0]                       # [8400, 85] = cx, cy, w, h, obj, 80 cls
+        grids, strides = _yolox_decode_tables()
+        xy = (out[:, :2] + grids) * strides
+        wh = np.exp(out[:, 2:4]) * strides
+        scores = out[:, 4:5] * out[:, 5:]
+        cls = scores.argmax(1)
+        sc = scores.max(1)
+        m = (cls == 0) & (sc > conf)                        # class 0 = person
+        boxes = [[int((cx - w / 2) / r), int((cy - h / 2) / r), int(w / r), int(h / r)]
+                 for (cx, cy), (w, h) in zip(xy[m], wh[m])]
+        if not boxes:
+            return []
+        idx = cv2.dnn.NMSBoxes(boxes, [float(x) for x in sc[m]], conf, 0.5)
+        out_rects = []
+        for i in np.array(idx).reshape(-1):
+            x, y, w, h = boxes[i]
+            out_rects.append((max(0, int(x - w * 0.08)), max(0, int(y - h * 0.05)), min(W, int(x + w * 1.08)), min(H, int(y + h * 1.05))))
+        return out_rects
+    if _hog is None:
+        return []
+    scale = 640.0 / W if W < 640 else 1.0          # HOG 검출 창(64x128)보다 사람이 작으면 못 잡으므로 확대
+    im = cv2.resize(img, None, fx=scale, fy=scale) if scale != 1.0 else img
+    with _hog_lock:
+        rects, weights = _hog.detectMultiScale(im, winStride=(8, 8), padding=(8, 8), scale=1.05)
+    out_rects = []
+    for (x, y, w, h), wt in zip(rects, np.ravel(weights) if len(rects) else []):
+        if wt < 0.3:
+            continue
+        x, y, w, h = x / scale, y / scale, w / scale, h / scale
+        out_rects.append((max(0, int(x - w * 0.1)), max(0, int(y - h * 0.05)), min(W, int(x + w * 1.1)), min(H, int(y + h * 1.05))))
+    return out_rects
+
+
+def _person_regions(img):
+    """모자이크할 영역 목록과 얼굴 수. BLUR_MODE 에 따라 얼굴만 / 사람 전체"""
+    H, W = img.shape[:2]
+    faces = _detect_faces(img)
+    regions = []
+    for (x, y, fw, fh) in faces:
+        if BLUR_MODE == "person":
+            regions.append(_face_to_person(x, y, fw, fh, W, H))
+        else:  # 머리카락/턱까지 덮이도록 조금 확장
+            regions.append((max(0, x - fw // 5), max(0, y - fh // 3), min(W, x + fw + fw // 5), min(H, y + fh + fh // 5)))
+    if BLUR_MODE == "person" or SERVER_DETECT:
+        for r in _detect_people(img):
+            # 이미 얼굴 기준 영역에 대부분 포함되면 생략
+            rx1, ry1, rx2, ry2 = r
+            covered = False
+            for (x1, y1, x2, y2) in regions:
+                ix = max(0, min(rx2, x2) - max(rx1, x1))
+                iy = max(0, min(ry2, y2) - max(ry1, y1))
+                if ix * iy > 0.7 * (rx2 - rx1) * (ry2 - ry1):
+                    covered = True
+                    break
+            if not covered:
+                regions.append(r)
+    return regions, len(faces)
+
+app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False
+app.json.ensure_ascii = False
+
+lock = threading.RLock()
+clients = {}       # mac -> dict(CLIENT_FIELDS)
+live = {}          # mac -> {"occupied", "faces", "rssi", "fps", "last_heartbeat", "snapshot", "snapshot_time"}
+
+
+# ---------------------------------------------------------------------------
+# 유틸
+# ---------------------------------------------------------------------------
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def norm_mac(mac):
+    return (mac or "").strip().upper().replace("-", ":")
+
+
+def gen_code():
+    return "%06d" % secrets.randbelow(1000000)
+
+
+def to_min(hhmm):
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def to_hhmm(minutes):
+    return "%02d:%02d" % (minutes // 60, minutes % 60)
+
+
+def slot_times():
+    """08:00, 08:30, ... 20:00 (경계 포함)"""
+    return [to_hhmm(m) for m in range(OPEN_HOUR * 60, CLOSE_HOUR * 60 + 1, SLOT_MIN)]
+
+
+def detector_status():
+    """대시보드/로그용 검출기 상태 문구"""
+    if not HAVE_CV2:
+        return "사용 안 함 - opencv 미설치 (pip install opencv-python-headless numpy)"
+    parts = []
+    parts.append("얼굴 " + ("YuNet" if _yunet is not None else ("Haar" if _cascades else "없음")))
+    parts.append("사람 " + ("YOLOX" if _yolox is not None else ("HOG" if _hog is not None else "없음(models/ 확인)")))
+    parts.append("블러 " + (("사람전체" if BLUR_MODE == "person" else "얼굴만") if SERVER_BLUR else "끔"))
+    parts.append("재실판정 " + ("켬" if SERVER_DETECT else "끔"))
+    return " · ".join(parts)
+
+
+def blur_faces(jpeg_bytes):
+    """JPEG 바이트에서 사람(BLUR_MODE=person) 또는 얼굴(face)을 찾아 모자이크 처리. (처리된 JPEG, 찾은 수) 반환.
+    OpenCV/모델이 없거나 디코딩 실패 시 원본 그대로 반환."""
+    if not (HAVE_CV2 and (SERVER_BLUR or SERVER_DETECT)):
+        return jpeg_bytes, 0
+    try:
+        img = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return jpeg_bytes, 0
+        regions, nfaces = _person_regions(img)
+        if not regions or not SERVER_BLUR:          # 검출만 하고 블러는 안 하는 경우
+            return jpeg_bytes, max(nfaces, len(regions))
+        for (x1, y1, x2, y2) in regions:
+            if x2 <= x1 or y2 <= y1:
+                continue
+            block = max(8, min(x2 - x1, y2 - y1) // 10)   # 영역 크기에 비례한 모자이크 블록
+            roi = img[y1:y2, x1:x2]
+            small = cv2.resize(roi, (max(1, roi.shape[1] // block), max(1, roi.shape[0] // block)), interpolation=cv2.INTER_LINEAR)
+            img[y1:y2, x1:x2] = cv2.resize(small, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_NEAREST)
+        ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        return (enc.tobytes() if ok else jpeg_bytes), max(nfaces, len(regions))
+    except Exception:  # noqa: BLE001
+        return jpeg_bytes, 0
+
+
+def valid_date(s):
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# CSV 저장/로드
+# ---------------------------------------------------------------------------
+def load_clients():
+    global clients
+    clients = {}
+    if not os.path.exists(CLIENTS_CSV):
+        return
+    with open(CLIENTS_CSV, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            mac = norm_mac(row.get("mac"))
+            if not mac:
+                continue
+            for k in CLIENT_FIELDS:
+                row.setdefault(k, "")
+            row["mac"] = mac
+            clients[mac] = row
+
+
+def save_clients():
+    tmp = CLIENTS_CSV + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CLIENT_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for row in clients.values():
+            w.writerow(row)
+    os.replace(tmp, CLIENTS_CSV)
+
+
+def load_reservations():
+    if not os.path.exists(RESERVATIONS_CSV):
+        return []
+    with open(RESERVATIONS_CSV, newline="", encoding="utf-8") as f:
+        return [dict(r) for r in csv.DictReader(f)]
+
+
+def save_reservations(rows):
+    tmp = RESERVATIONS_CSV + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=RES_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    os.replace(tmp, RESERVATIONS_CSV)
+
+
+# ---------------------------------------------------------------------------
+# 클라이언트(기기) 상태 계산
+# ---------------------------------------------------------------------------
+def client_view(mac):
+    c = clients[mac]
+    lv = live.get(mac, {})
+    last_hb = lv.get("last_heartbeat", 0)
+    online = c.get("authorized") == "1" and (time.time() - last_hb) < OFFLINE_AFTER_SEC
+    # 재실 = 보드가 보고한 occupied  OR  서버가 최근 스냅샷에서 사람/얼굴을 찾음 (보드 얼굴 감지가 꺼져 있어도 동작)
+    server_seen = (time.time() - lv.get("server_person_time", 0)) < PRESENCE_HOLD_SEC
+    occupied = online and (bool(lv.get("occupied")) or server_seen)
+    faces = max(int(lv.get("faces", 0)), int(lv.get("server_faces", 0)) if server_seen else 0) if online else 0
+    return {
+        "mac": mac,
+        "ip": c.get("ip", ""),
+        "room": c.get("room", ""),
+        "authorized": c.get("authorized") == "1",
+        "online": online,
+        "occupied": occupied,
+        "faces": faces,
+        "occupied_by_server": online and server_seen and not bool(lv.get("occupied")),
+        "rssi": lv.get("rssi"),
+        "fps": lv.get("fps"),
+        "last_seen": c.get("last_seen", ""),
+        "last_heartbeat_ago": int(time.time() - last_hb) if last_hb else None,
+        "detect": lv.get("detect"),                 # None: 알 수 없음, False: 기기 얼굴 감지 꺼짐
+        "server_faces": int(lv.get("server_faces", 0)),
+        "has_snapshot": bool(lv.get("snapshot")),
+        "snapshot_age": int(time.time() - lv["snapshot_time"]) if lv.get("snapshot_time") else None,
+        "stream_url": "http://%s:81/stream" % c.get("ip", "") if c.get("ip") else "",
+        "device_url": "http://%s/" % c.get("ip", "") if c.get("ip") else "",
+    }
+
+
+def current_reservation(room, rows=None, when=None):
+    when = when or datetime.now()
+    rows = rows if rows is not None else load_reservations()
+    d = when.strftime("%Y-%m-%d")
+    nowm = when.hour * 60 + when.minute
+    for r in rows:
+        if r["room"] == room and r["date"] == d and to_min(r["start"]) <= nowm < to_min(r["end"]):
+            return r
+    return None
+
+
+def check_device_token(mac, token):
+    c = clients.get(mac)
+    return bool(c and c.get("authorized") == "1" and c.get("token") and c["token"] == token)
+
+
+# ---------------------------------------------------------------------------
+# 기기 API (ESP32 -> 서버)
+# ---------------------------------------------------------------------------
+@app.post("/api/register")
+def api_register():
+    d = request.get_json(silent=True) or {}
+    mac = norm_mac(d.get("mac"))
+    if not mac:
+        return jsonify(ok=False, error="mac required"), 400
+    ip = (d.get("ip") or request.remote_addr or "").strip()
+    room = (d.get("room") or "").strip()
+    token = d.get("token") or ""
+    with lock:
+        c = clients.get(mac)
+        is_new = c is None
+        if is_new:
+            c = {k: "" for k in CLIENT_FIELDS}
+            c.update(mac=mac, auth_code=gen_code(), authorized="0", first_seen=now_str(), fail_count="0")
+            clients[mac] = c
+        c["ip"] = ip
+        if room:
+            c["room"] = room
+        c["last_seen"] = now_str()
+        save_clients()
+        authorized = check_device_token(mac, token)
+        code = c["auth_code"]
+    if is_new:
+        print("\n[NEW CLIENT] MAC=%s IP=%s 회의실=%s  ->  인증코드: %s\n" % (mac, ip, room, code), flush=True)
+    elif not authorized:
+        print("[CLIENT] 미인증 기기 접속 MAC=%s IP=%s 회의실=%s  인증코드: %s" % (mac, ip, room, code), flush=True)
+    msg = "인증됨" if authorized else "관리자 페이지(/admin)에서 인증코드를 확인 후 입력하세요"
+    return jsonify(ok=True, authorized=authorized, message=msg)
+
+
+@app.post("/api/auth")
+def api_auth():
+    d = request.get_json(silent=True) or {}
+    mac = norm_mac(d.get("mac"))
+    code = (d.get("code") or "").strip()
+    with lock:
+        c = clients.get(mac)
+        if not c:
+            return jsonify(ok=False, error="등록되지 않은 기기입니다. 잠시 후 다시 시도하세요"), 404
+        c["ip"] = (d.get("ip") or request.remote_addr or c.get("ip", "")).strip()
+        if d.get("room"):
+            c["room"] = d["room"].strip()
+        c["last_seen"] = now_str()
+        if not code or code != c["auth_code"]:
+            fails = int(c.get("fail_count") or 0) + 1
+            c["fail_count"] = str(fails)
+            if fails >= MAX_AUTH_FAILS:
+                c["auth_code"] = gen_code()
+                c["fail_count"] = "0"
+                print("[AUTH] MAC=%s 연속 실패로 인증코드 재발급: %s" % (mac, c["auth_code"]), flush=True)
+                save_clients()
+                return jsonify(ok=False, error="연속 실패로 인증코드가 재발급되었습니다. 관리자 페이지를 확인하세요"), 401
+            save_clients()
+            return jsonify(ok=False, error="인증코드가 올바르지 않습니다 (%d/%d)" % (fails, MAX_AUTH_FAILS)), 401
+        token = secrets.token_hex(16)
+        c.update(authorized="1", token=token, fail_count="0")
+        save_clients()
+    print("[AUTH] MAC=%s 인증 성공 (회의실: %s)" % (mac, c.get("room")), flush=True)
+    return jsonify(ok=True, token=token, room=c.get("room", ""))
+
+
+@app.post("/api/heartbeat")
+def api_heartbeat():
+    d = request.get_json(silent=True) or {}
+    mac = norm_mac(d.get("mac"))
+    with lock:
+        if not check_device_token(mac, d.get("token") or ""):
+            return jsonify(ok=False, error="unauthorized"), 401
+        c = clients[mac]
+        c["ip"] = (d.get("ip") or request.remote_addr or c.get("ip", "")).strip()
+        if d.get("room"):
+            c["room"] = d["room"].strip()
+        c["last_seen"] = now_str()
+        lv = live.setdefault(mac, {})
+        lv.update(occupied=bool(d.get("occupied")), faces=int(d.get("faces") or 0),
+                  rssi=d.get("rssi"), fps=d.get("fps"), last_heartbeat=time.time())
+        if "detect" in d:
+            lv["detect"] = bool(d.get("detect"))   # 기기 얼굴 감지(블러) 사용 가능 여부
+        # last_seen 만 바뀌므로 매번 저장하지 않고 1분에 한 번만 기록
+        if time.time() - lv.get("last_saved", 0) > 60:
+            lv["last_saved"] = time.time()
+            save_clients()
+    return jsonify(ok=True)
+
+
+@app.post("/api/snapshot")
+def api_snapshot():
+    mac = norm_mac(request.headers.get("X-Device-Mac"))
+    token = request.headers.get("X-Device-Token", "")
+    data = request.get_data()
+    with lock:
+        if not check_device_token(mac, token):
+            return jsonify(ok=False, error="unauthorized"), 401
+    if not data or len(data) < 100:
+        return jsonify(ok=False, error="empty"), 400
+    # 기기에서 블러가 됐더라도 서버에서 한 번 더 (기기 얼굴 감지가 꺼진 경우의 안전장치). lock 밖에서 수행
+    data, server_faces = blur_faces(data)
+    with lock:
+        lv = live.setdefault(mac, {})
+        lv["snapshot"] = data
+        lv["server_faces"] = server_faces
+        if server_faces > 0:
+            lv["server_person_time"] = time.time()   # 서버측 검출도 재실 판정에 반영
+        if request.headers.get("X-Device-Detect") is not None:
+            lv["detect"] = request.headers.get("X-Device-Detect") == "1"
+        lv["snapshot_time"] = time.time()
+        # 스냅샷은 heartbeat 를 겸함
+        lv["last_heartbeat"] = time.time()
+        if request.headers.get("X-Device-Occupied") is not None:
+            lv["occupied"] = request.headers.get("X-Device-Occupied") == "1"
+        if request.headers.get("X-Device-Faces") is not None:
+            try:
+                lv["faces"] = int(request.headers.get("X-Device-Faces"))
+            except ValueError:
+                pass
+    try:
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        with open(os.path.join(SNAPSHOT_DIR, mac.replace(":", "") + ".jpg"), "wb") as f:
+            f.write(data)
+    except OSError:
+        pass
+    return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------------------
+# 대시보드 / 예약 API (브라우저 -> 서버)
+# ---------------------------------------------------------------------------
+@app.get("/api/rooms")
+def api_rooms():
+    with lock:
+        rows = load_reservations()
+        out = []
+        for mac in clients:
+            v = client_view(mac)
+            if not v["authorized"]:
+                continue
+            cur = current_reservation(v["room"], rows) if v["room"] else None
+            v["current_reservation"] = cur
+            out.append(v)
+    out.sort(key=lambda x: (x["room"] or "~", x["mac"]))
+    return jsonify(rooms=out, server_time=now_str())
+
+
+@app.get("/api/room-names")
+def api_room_names():
+    with lock:
+        names = {c.get("room") for c in clients.values() if c.get("authorized") == "1" and c.get("room")}
+        names |= {r["room"] for r in load_reservations()}
+    return jsonify(rooms=sorted(names))
+
+
+@app.get("/snapshot/<mac>.jpg")
+def snapshot_image(mac):
+    mac = norm_mac(mac)
+    with lock:
+        data = live.get(mac, {}).get("snapshot")
+    if not data:
+        abort(404)
+    return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/reservations")
+def api_reservations_list():
+    room = request.args.get("room", "")
+    d = request.args.get("date", "")
+    with lock:
+        rows = load_reservations()
+    if room:
+        rows = [r for r in rows if r["room"] == room]
+    if d:
+        rows = [r for r in rows if r["date"] == d]
+    rows.sort(key=lambda r: (r["date"], r["room"], r["start"]))
+    return jsonify(reservations=rows, slots=slot_times())
+
+
+@app.post("/api/reservations")
+def api_reservations_create():
+    d = request.get_json(silent=True) or {}
+    room = (d.get("room") or "").strip()
+    day = (d.get("date") or "").strip()
+    start = (d.get("start") or "").strip()
+    end = (d.get("end") or "").strip()
+    purpose = (d.get("purpose") or "").strip()
+    reserver = (d.get("reserver") or "").strip()
+
+    slots = slot_times()
+    if not room:
+        return jsonify(ok=False, error="회의실을 선택하세요"), 400
+    if not valid_date(day):
+        return jsonify(ok=False, error="날짜 형식이 올바르지 않습니다"), 400
+    if start not in slots or end not in slots:
+        return jsonify(ok=False, error="시간은 %02d:00 ~ %02d:00 사이 30분 단위여야 합니다" % (OPEN_HOUR, CLOSE_HOUR)), 400
+    if to_min(start) >= to_min(end):
+        return jsonify(ok=False, error="종료 시간은 시작 시간보다 늦어야 합니다"), 400
+    if not reserver:
+        return jsonify(ok=False, error="예약자명을 입력하세요"), 400
+    if not purpose:
+        return jsonify(ok=False, error="회의 목적을 입력하세요"), 400
+
+    with lock:
+        rows = load_reservations()
+        for r in rows:
+            if r["room"] == room and r["date"] == day and to_min(start) < to_min(r["end"]) and to_min(r["start"]) < to_min(end):
+                return jsonify(ok=False, error="이미 예약된 시간과 겹칩니다 (%s~%s %s)" % (r["start"], r["end"], r["reserver"])), 409
+        new = {"id": uuid.uuid4().hex[:10], "room": room, "date": day, "start": start, "end": end,
+               "purpose": purpose, "reserver": reserver, "created_at": now_str()}
+        rows.append(new)
+        save_reservations(rows)
+    print("[RESERVE] %s %s %s~%s %s (%s)" % (room, day, start, end, reserver, purpose), flush=True)
+    return jsonify(ok=True, reservation=new)
+
+
+@app.route("/api/reservations/<rid>", methods=["PATCH", "PUT"])
+def api_reservations_update(rid):
+    """예약 시간(또는 목적/예약자) 변경. 시간 막대에서 블록을 끌어 옮길 때 사용"""
+    d = request.get_json(silent=True) or {}
+    slots = slot_times()
+    with lock:
+        rows = load_reservations()
+        cur = next((r for r in rows if r["id"] == rid), None)
+        if not cur:
+            return jsonify(ok=False, error="예약을 찾을 수 없습니다"), 404
+        start = (d.get("start") or cur["start"]).strip()
+        end = (d.get("end") or cur["end"]).strip()
+        day = (d.get("date") or cur["date"]).strip()
+        purpose = (d.get("purpose") or cur["purpose"]).strip()
+        reserver = (d.get("reserver") or cur["reserver"]).strip()
+        if not valid_date(day):
+            return jsonify(ok=False, error="날짜 형식이 올바르지 않습니다"), 400
+        if start not in slots or end not in slots:
+            return jsonify(ok=False, error="시간은 %02d:00 ~ %02d:00 사이 30분 단위여야 합니다" % (OPEN_HOUR, CLOSE_HOUR)), 400
+        if to_min(start) >= to_min(end):
+            return jsonify(ok=False, error="종료 시간은 시작 시간보다 늦어야 합니다"), 400
+        for r in rows:
+            if r["id"] != rid and r["room"] == cur["room"] and r["date"] == day and to_min(start) < to_min(r["end"]) and to_min(r["start"]) < to_min(end):
+                return jsonify(ok=False, error="이미 예약된 시간과 겹칩니다 (%s~%s %s)" % (r["start"], r["end"], r["reserver"])), 409
+        old = "%s %s~%s" % (cur["date"], cur["start"], cur["end"])
+        cur.update(date=day, start=start, end=end, purpose=purpose, reserver=reserver)
+        save_reservations(rows)
+    print("[MOVE] %s %s -> %s %s~%s (%s)" % (cur["room"], old, day, start, end, reserver), flush=True)
+    return jsonify(ok=True, reservation=cur)
+
+
+@app.delete("/api/reservations/<rid>")
+def api_reservations_delete(rid):
+    with lock:
+        rows = load_reservations()
+        keep = [r for r in rows if r["id"] != rid]
+        if len(keep) == len(rows):
+            return jsonify(ok=False, error="예약을 찾을 수 없습니다"), 404
+        save_reservations(keep)
+    return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------------------
+# 관리자
+# ---------------------------------------------------------------------------
+def admin_required():
+    if not ADMIN_PASSWORD:
+        return None
+    a = request.authorization
+    if a and a.password == ADMIN_PASSWORD:
+        return None
+    return Response("인증 필요", 401, {"WWW-Authenticate": 'Basic realm="meetingroom admin"'})
+
+
+@app.get("/admin")
+def admin_page():
+    r = admin_required()
+    if r:
+        return r
+    with lock:
+        rows = []
+        for mac in sorted(clients):
+            v = client_view(mac)
+            v["auth_code"] = clients[mac]["auth_code"]
+            v["first_seen"] = clients[mac].get("first_seen", "")
+            rows.append(v)
+    return render_template_string(ADMIN_HTML, rows=rows, csv_path=CLIENTS_CSV, server_time=now_str())
+
+
+@app.post("/admin/action")
+def admin_action():
+    r = admin_required()
+    if r:
+        return r
+    mac = norm_mac(request.form.get("mac"))
+    action = request.form.get("action")
+    with lock:
+        c = clients.get(mac)
+        if not c:
+            abort(404)
+        if action == "revoke":
+            c.update(authorized="0", token="", auth_code=gen_code(), fail_count="0")
+            live.pop(mac, None)
+        elif action == "regen":
+            c.update(auth_code=gen_code(), fail_count="0")
+        elif action == "room":
+            c["room"] = (request.form.get("room") or "").strip()
+        elif action == "delete":
+            del clients[mac]
+            live.pop(mac, None)
+        save_clients()
+    return redirect(url_for("admin_page"))
+
+
+# ---------------------------------------------------------------------------
+# 대시보드 페이지
+# ---------------------------------------------------------------------------
+@app.get("/")
+def index():
+    html = render_template_string(INDEX_HTML, open_hour=OPEN_HOUR, close_hour=CLOSE_HOUR,
+                                  slot_min=SLOT_MIN, today=date.today().isoformat(),
+                                  server_blur=HAVE_CV2 and SERVER_BLUR, detector=detector_status(),
+                                  detector_ok=HAVE_CV2 and (_yolox is not None or _hog is not None or _yunet is not None or bool(_cascades)))
+    # 브라우저가 예전 JS 를 캐시해 쓰지 않도록
+    return Response(html, mimetype="text/html", headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"})
+
+
+BASE_CSS = """
+:root{--bg:#f3f5f7;--card:#fff;--fg:#1c2430;--muted:#66717f;--line:#dde2e8;--acc:#2563eb;--acc2:#dbeafe;--ok:#16a34a;--warn:#d97706;--bad:#dc2626}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,"Apple SD Gothic Neo","Malgun Gothic",sans-serif;background:var(--bg);color:var(--fg);font-size:14px}
+header{background:#111827;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:16px}header h1{font-size:18px;margin:0;font-weight:600}
+header a{color:#cbd5e1;text-decoration:none;font-size:13px}header .sp{flex:1}
+main{max-width:1000px;margin:0 auto;padding:18px;display:grid;gap:16px}
+/* grid 아이템은 기본 min-width:auto 라서 안쪽의 넓은 시간 막대가 카드를 화면보다 넓게 늘림 → 0 으로 고정 */
+main>*{min-width:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;max-width:100%}.card h2{font-size:16px;margin:0 0 12px}
+input,select,button,textarea{font:inherit}input[type=text],input[type=date],input[type=password],select{padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:#fff}
+button{padding:8px 14px;border:none;border-radius:6px;background:var(--acc);color:#fff;cursor:pointer;white-space:nowrap}button.sec{background:#e5e7eb;color:var(--fg)}button.bad{background:var(--bad)}button.sm{padding:4px 9px;font-size:12px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}label{font-size:12px;color:var(--muted);display:block;margin-bottom:3px}
+.badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;color:#fff;background:#9ca3af}.badge.ok{background:var(--ok)}.badge.warn{background:var(--warn)}.badge.bad{background:var(--bad)}.badge.acc{background:var(--acc)}
+table{border-collapse:collapse;width:100%}th,td{padding:8px 6px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{font-size:12px;color:var(--muted);font-weight:600}
+.muted{color:var(--muted);font-size:12px}code{background:#f1f5f9;padding:1px 5px;border-radius:4px}
+"""
+
+INDEX_HTML = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>회의실 예약 시스템</title>
+<style>
+""" + BASE_CSS + r"""
+.rooms{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+.room{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff;display:flex;flex-direction:column}
+.room .img{background:#111;aspect-ratio:4/3;position:relative}.room .img img{width:100%;height:100%;object-fit:cover;display:block}
+.room .img .noimg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:13px}
+.room .img .st{position:absolute;left:8px;top:8px}.room .body{padding:10px 12px;display:grid;gap:6px}.room .name{font-weight:600;font-size:15px}
+.room.selected{outline:2px solid var(--acc)}
+.tl-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.tl-wrap{width:100%;max-width:100%;overflow:hidden;border:1px solid var(--line);border-radius:8px;background:#fafbfc;user-select:none;-webkit-user-select:none}
+.tl{position:relative;width:100%;height:112px}  /* 30분 칸 18개가 컨테이너 폭에 맞춰 균등 배치 - 좌우 스크롤 없음 */
+.tl-hours{position:absolute;left:0;top:0;height:28px;width:100%}.tl-hours span{position:absolute;top:6px;font-size:12px;color:var(--muted);transform:translateX(-50%);white-space:nowrap}
+.tl-hours span::after{content:"";position:absolute;left:50%;top:18px;width:1px;height:8px;background:var(--line)}
+.tl-hours span.half{display:none}                       /* 30분 눈금 라벨은 숨기고 정시만 표시 */
+.tl-hours span:last-child{transform:translateX(-100%)}  /* 마지막(20:00) 라벨이 오른쪽 밖으로 나가지 않게 */
+.tl-hours span:first-child{transform:translateX(0)}
+.tl-slots{position:absolute;left:0;top:30px;height:72px;width:100%;display:flex}
+.slot{flex:1 1 0;min-width:0;height:100%;border-right:1px dashed var(--line);border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:#fff;cursor:pointer;position:relative}
+.slot:last-child{border-right:none}
+@media (max-width:700px){.tl-hours span:not(.h3){display:none}.tl .res span:not(.x):not(.h){display:none}.tl .res{padding:4px 4px}}  /* 좁은 화면: 3시간 간격 라벨, 막대에는 이름만 */
+.slot:nth-child(2n){background:#f8fafc}.slot:hover{background:#eef4ff}.slot.sel{background:var(--acc2)}.slot.busy{background:#f3f4f6;cursor:not-allowed}.slot.past{background:repeating-linear-gradient(45deg,#f6f7f8,#f6f7f8 6px,#eceef1 6px,#eceef1 12px)}
+.slot small{display:none}
+.res{position:absolute;top:36px;height:60px;border-radius:6px;background:#2563eb;color:#fff;padding:5px 8px;font-size:12px;overflow:hidden;cursor:grab;box-shadow:0 1px 3px rgba(0,0,0,.25);pointer-events:auto;touch-action:none}
+.res.dragging{cursor:grabbing;opacity:.92;z-index:5;box-shadow:0 4px 12px rgba(0,0,0,.35);transition:none}.res.conflict{background:var(--bad)}.res.hit{outline:3px solid var(--bad);outline-offset:1px}
+.res .h{position:absolute;top:0;bottom:0;width:10px;cursor:ew-resize;opacity:0}.res .hl{left:0}.res .hr{right:0}
+.res .h::after{content:"";position:absolute;top:50%;width:3px;height:22px;margin-top:-11px;border-radius:2px;background:rgba(255,255,255,.85)}.res .hl::after{left:3px}.res .hr::after{right:3px}
+.res:hover .h,.res.resizing .h{opacity:1}.res.resizing{cursor:ew-resize}
+.drag-tip{position:absolute;z-index:6;top:4px;transform:translateX(-50%);background:#111827;color:#fff;font-size:12px;padding:4px 9px;border-radius:6px;white-space:nowrap;pointer-events:none;box-shadow:0 2px 6px rgba(0,0,0,.3)}.drag-tip.bad{background:var(--bad)}.res .x{position:absolute;right:4px;top:2px;font-size:13px;opacity:.7;cursor:pointer}.res .x:hover{opacity:1}
+.res b{display:block;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.res span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;opacity:.9}
+.res.now{background:#16a34a}
+.tl-now{position:absolute;top:26px;bottom:6px;width:2px;background:var(--bad);z-index:3;pointer-events:none}.tl-now::before{content:"지금";position:absolute;top:-16px;left:-12px;font-size:10px;color:var(--bad)}
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-top:12px}
+.msg{margin-top:8px;min-height:18px;font-size:13px}.msg.ok{color:var(--ok)}.msg.bad{color:var(--bad)}
+.legend{display:flex;gap:12px;font-size:12px;color:var(--muted);align-items:center}.legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:4px;vertical-align:-2px}
+</style></head><body>
+<header><h1>회의실 예약 시스템</h1><span class="muted" id="clock"></span><span class="sp"></span><a href="/admin">관리자</a></header>
+<main>
+<div class="card"><h2>회의실 현황 <span class="muted" id="roomsNote"></span></h2>
+<p class="muted" style="margin:-6px 0 10px{% if not detector_ok %};color:#dc2626{% endif %}">서버 검출: {{ detector }}{% if not detector_ok %} — 사람/얼굴 검출이 꺼져 있어 보드가 얼굴을 못 잡으면 "비어있음"으로 표시됩니다{% endif %}</p><div class="rooms" id="rooms"><div class="muted">인증된 카메라가 아직 없습니다. 기기에서 인증코드를 입력하면 여기에 표시됩니다.</div></div></div>
+
+<div class="card"><h2>예약</h2>
+<div class="row">
+ <div><label>회의실</label><select id="room" style="min-width:180px"></select></div>
+ <div><label>날짜</label><input type="date" id="date" value="{{ today }}"></div>
+ <div style="align-self:end"><button class="sec" onclick="shiftDate(-1)">◀ 이전일</button> <button class="sec" onclick="setToday()">오늘</button> <button class="sec" onclick="shiftDate(1)">다음날 ▶</button></div>
+</div>
+<div class="tl-toolbar" style="margin-top:14px">
+ <span class="muted">{{ '%02d' % open_hour }}:00 ~ {{ '%02d' % close_hour }}:00 · {{ slot_min }}분 단위 · 빈 칸을 클릭/드래그해서 시간 선택 · 예약 블록 가운데를 끌면 이동, 양쪽 끝을 끌면 시간 늘리기/줄이기 · ✕ 로 취소</span>
+ <span class="sp" style="flex:1"></span>
+ <span class="legend"><span><i style="background:#2563eb"></i>예약됨</span><span><i style="background:#16a34a"></i>진행 중</span><span><i style="background:#dbeafe;border:1px solid #93c5fd"></i>선택</span></span>
+</div>
+<div class="tl-wrap" id="tlWrap"><div class="tl" id="tl"><div class="tl-hours" id="tlHours"></div><div class="tl-slots" id="tlSlots"></div><div id="tlRes"></div><div class="tl-now" id="tlNow" style="display:none"></div></div></div>
+
+<div class="form-grid">
+ <div><label>시작</label><select id="start"></select></div>
+ <div><label>종료</label><select id="end"></select></div>
+ <div><label>예약자명</label><input type="text" id="reserver" placeholder="홍길동" style="width:100%"></div>
+ <div style="grid-column:span 2"><label>회의 목적</label><input type="text" id="purpose" placeholder="주간 회의" style="width:100%"></div>
+ <div style="align-self:end"><button id="btnReserve" onclick="reserve()" style="width:100%">예약하기</button></div>
+</div>
+<div class="msg" id="msg"></div>
+<h2 style="margin-top:18px;font-size:14px">이 날의 예약 목록</h2>
+<table><thead><tr><th>시간</th><th>회의실</th><th>예약자</th><th>회의 목적</th><th></th></tr></thead><tbody id="resList"><tr><td colspan="5" class="muted">예약 없음</td></tr></tbody></table>
+</div>
+</main>
+<script>
+const OPEN={{ open_hour }}, CLOSE={{ close_hour }}, STEP={{ slot_min }};
+const SERVER_BLUR={{ 'true' if server_blur else 'false' }};
+const NSLOTS=(CLOSE-OPEN)*60/STEP;
+const $=id=>document.getElementById(id);
+const wrap=$('tlWrap');
+const pct=slots=>(slots/NSLOTS*100)+'%';   // 칸 수 -> 가로 위치/폭 (%). 스크롤 없이 컨테이너 폭에 맞춤
+const hhmm=m=>String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');
+const slotMin=i=>OPEN*60+i*STEP;
+let reservations=[], selStart=-1, selEnd=-1, dragging=false, rooms=[];
+
+// ---- 시간 눈금 / 칸 생성 ----
+(function build(){
+  const hours=$('tlHours');
+  for(let i=0;i<=NSLOTS;i++){const s=document.createElement('span');s.style.left=pct(i);s.textContent=hhmm(slotMin(i));if(slotMin(i)%60!==0)s.className='half';else if((slotMin(i)/60-OPEN)%3===0)s.className='h3';hours.appendChild(s)}
+  const slots=$('tlSlots');
+  for(let i=0;i<NSLOTS;i++){const d=document.createElement('div');d.className='slot';d.dataset.i=i;d.innerHTML='<small>'+hhmm(slotMin(i))+'</small>';slots.appendChild(d)}
+  for(let i=0;i<=NSLOTS;i++){const o1=new Option(hhmm(slotMin(i)),hhmm(slotMin(i)));const o2=new Option(hhmm(slotMin(i)),hhmm(slotMin(i)));if(i<NSLOTS)$('start').add(o1);if(i>0)$('end').add(o2)}
+  $('start').onchange=()=>{selStart=Math.max(0,($('start').value.split(':')[0]*60+ +$('start').value.split(':')[1]-OPEN*60)/STEP);if($('end').selectedIndex<selStart+0)$('end').selectedIndex=selStart;selEnd=$('end').selectedIndex;paintSel()};
+  $('end').onchange=()=>{selEnd=$('end').selectedIndex;if(selEnd<selStart)selEnd=selStart;paintSel()};
+})();
+
+// ---- 칸 클릭/드래그로 시간 범위 선택 ----
+wrap.addEventListener('mousedown',e=>{
+  const slot=e.target.closest('.slot');
+  if(slot&&!slot.classList.contains('busy')&&!slot.classList.contains('past')){ // 칸 드래그 = 범위 선택
+    dragging=true;selStart=selEnd=+slot.dataset.i;paintSel();e.preventDefault()}
+});
+window.addEventListener('mousemove',e=>{
+  if(dragging){const slot=document.elementFromPoint(e.clientX,e.clientY)?.closest('.slot');if(slot)extendSel(+slot.dataset.i)}
+});
+window.addEventListener('mouseup',()=>{if(dragging){dragging=false;syncForm()}});
+// 터치: 칸 탭 = 시작 지정 후 다시 탭 = 종료 지정
+wrap.addEventListener('click',e=>{const slot=e.target.closest('.slot');if(!slot||!('ontouchstart' in window))return;if(slot.classList.contains('busy')||slot.classList.contains('past'))return;
+  const i=+slot.dataset.i;if(selStart<0||i<selStart||selEnd>selStart){selStart=selEnd=i}else{extendSel(i)}paintSel();syncForm()});
+// ---- 예약 블록을 좌우로 끌어 시간 변경 (30분 단위 스냅, 놓으면 서버에 반영) ----
+let drag=null;
+const slotPx=()=>$('tl').getBoundingClientRect().width/NSLOTS;
+const overlapWith=(id,s,e)=>reservations.find(r=>r.id!==id&&toMin(r.start)<e&&s<toMin(r.end));   // 겹치는 기존 예약 (없으면 undefined)
+const overlaps=(id,s,e)=>!!overlapWith(id,s,e);
+const resLabel=r=>r.start+'~'+r.end+' '+r.reserver+(r.purpose?' ('+r.purpose+')':'');
+function showTip(el,text,bad){let t=$('dragTip');if(!t){t=document.createElement('div');t.id='dragTip';t.className='drag-tip';$('tl').appendChild(t)}
+  t.textContent=text;t.className='drag-tip'+(bad?' bad':'');const tl=$('tl').getBoundingClientRect(),r=el.getBoundingClientRect();t.style.left=(r.left-tl.left+r.width/2)+'px';t.style.display=''}
+function hideTip(){const t=$('dragTip');if(t)t.style.display='none';document.querySelectorAll('.res.hit').forEach(e=>e.classList.remove('hit'))}
+// mode: 'move'(통째로 이동) / 'start'(시작 시간 조절) / 'end'(종료 시간 조절)
+function pickMode(el,target,x){if(target.closest('.hl'))return 'start';if(target.closest('.hr'))return 'end';
+  const r=el.getBoundingClientRect(),edge=Math.min(14,r.width/4);   // 손잡이가 아니어도 가장자리 근처면 크기 조절
+  if(x-r.left<edge)return 'start';if(r.right-x<edge)return 'end';return 'move'}
+function beginDrag(el,x,mode){const res=reservations.find(r=>r.id===el.dataset.id);if(!res)return;
+  const s0=(toMin(res.start)-OPEN*60)/STEP,e0=(toMin(res.end)-OPEN*60)/STEP;
+  drag={id:res.id,res,el,mode,s0,e0,s:s0,e:e0,x0:x,moved:false};el.classList.add('dragging');el.classList.add(mode==='move'?'moving':'resizing');
+  showTip(el,res.start+' ~ '+res.end+(mode==='move'?'  (좌우로 끌어 이동)':mode==='start'?'  (시작 시간 조절)':'  (종료 시간 조절)'),false)}
+function applyDrag(){const d=drag,s=slotMin(d.s),e=slotMin(d.e),hit=overlapWith(d.id,s,e),bad=!!hit;
+  d.el.style.left='calc('+pct(d.s)+' + 2px)';d.el.style.width='calc('+pct(d.e-d.s)+' - 4px)';
+  d.el.querySelector('.t').textContent=hhmm(s)+'~'+hhmm(e);d.el.classList.toggle('conflict',bad);
+  document.querySelectorAll('.res.hit').forEach(x=>x.classList.remove('hit'));if(hit){const h=document.querySelector('.res[data-id="'+hit.id+'"]');if(h)h.classList.add('hit')}
+  const dur=(d.e-d.s)*STEP,durTxt=(dur>=60?Math.floor(dur/60)+'시간':'')+(dur%60?' '+dur%60+'분':'');
+  showTip(d.el,bad?'⚠ '+resLabel(hit)+' 예약과 겹칩니다':hhmm(s)+' ~ '+hhmm(e)+' ('+durTxt.trim()+')',bad);
+  const m=$('msg');m.className='msg'+(bad?' bad':'');m.textContent=(bad?'겹침: '+resLabel(hit)+' → ':(d.mode==='move'?'이동 중: ':'시간 조절 중: '))+hhmm(s)+' ~ '+hhmm(e)}
+function moveDrag(x){if(!drag)return;if(Math.abs(x-drag.x0)>4)drag.moved=true;
+  const d=drag,delta=Math.round((x-d.x0)/slotPx());let ns=d.s,ne=d.e;
+  if(d.mode==='move'){const dur=d.e0-d.s0;ns=Math.max(0,Math.min(NSLOTS-dur,d.s0+delta));ne=ns+dur}
+  else if(d.mode==='start'){ns=Math.max(0,Math.min(d.e0-1,d.s0+delta))}          // 최소 30분 유지
+  else{ne=Math.max(d.s0+1,Math.min(NSLOTS,d.e0+delta))}
+  if(ns===d.s&&ne===d.e)return;d.s=ns;d.e=ne;applyDrag()}
+async function moveRes(id,start,end){   // 서버에 시간 변경 요청. 성공 시 true
+  const r=await fetch('/api/reservations/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({start,end})});const j=await r.json();
+  if(!j.ok)throw new Error(j.error||'변경 실패');return true}
+async function endDrag(){if(!drag)return;const d=drag;drag=null;d.el.classList.remove('dragging','moving','resizing');hideTip();
+  const m=$('msg');
+  if(!d.moved||(d.s===d.s0&&d.e===d.e0)){m.className='msg';m.textContent='';render();return}
+  const s=slotMin(d.s),e=slotMin(d.e),hit=overlapWith(d.id,s,e);
+  if(hit){render();m.className='msg bad';m.textContent='기존 예약과 겹쳐서 변경되지 않았습니다: '+resLabel(hit);
+    alert('기존 예약과 겹칩니다.\n\n  '+resLabel(hit)+'\n\n'+d.res.reserver+' 예약은 '+d.res.start+'~'+d.res.end+' 그대로 유지됩니다.');return}
+  const what=d.mode==='move'?'이동':d.mode==='start'?'시작 시간 변경':'종료 시간 변경';
+  try{await moveRes(d.id,hhmm(s),hhmm(e));
+    m.className='msg ok';m.innerHTML=esc(d.res.reserver)+' 예약 '+what+': '+d.res.start+'~'+d.res.end+' → <b>'+hhmm(s)+' ~ '+hhmm(e)+'</b> ';
+    const u=document.createElement('button');u.className='sm sec';u.textContent='되돌리기';u.onclick=async()=>{try{await moveRes(d.id,d.res.start,d.res.end);m.className='msg';m.textContent='원래 시간('+d.res.start+'~'+d.res.end+')으로 되돌렸습니다'}catch(err){alert(err.message)}loadReservations();loadRooms()};m.appendChild(u)}
+  catch(err){render();m.className='msg bad';m.textContent='변경 실패: '+err.message;alert('변경할 수 없습니다.\n\n'+err.message)}
+  loadReservations();loadRooms()}
+$('tlRes').addEventListener('mousedown',e=>{if(e.button!==0)return;const el=e.target.closest('.res');if(!el||e.target.closest('.x'))return;beginDrag(el,e.clientX,pickMode(el,e.target,e.clientX));e.preventDefault()});
+window.addEventListener('mousemove',e=>{if(drag)moveDrag(e.clientX)});
+window.addEventListener('mouseup',()=>{if(drag)endDrag()});
+$('tlRes').addEventListener('touchstart',e=>{const el=e.target.closest('.res');if(!el||e.target.closest('.x'))return;const x=e.touches[0].clientX;beginDrag(el,x,pickMode(el,e.target,x));e.preventDefault()},{passive:false});
+window.addEventListener('touchmove',e=>{if(drag){moveDrag(e.touches[0].clientX);e.preventDefault()}},{passive:false});
+window.addEventListener('touchend',()=>{if(drag)endDrag()});
+// ✕ 버튼: 예약 취소
+$('tlRes').addEventListener('click',e=>{const x=e.target.closest('.x');if(!x)return;const el=x.closest('.res');const res=reservations.find(r=>r.id===el.dataset.id);if(!res)return;
+  if(confirm(res.start+'~'+res.end+' '+res.reserver+' ('+res.purpose+')\n이 예약을 취소할까요?'))delRes(res.id)});
+
+function extendSel(i){ // selStart 부터 i 까지, 중간에 예약된 칸이 있으면 그 앞까지만
+  if(i<selStart){selStart=i;return paintSel()}
+  let j=selStart;while(j<i&&!isBusy(j+1))j++;selEnd=j;paintSel()}
+function isBusy(i){const s=slotMin(i),e=s+STEP;return reservations.some(r=>toMin(r.start)<e&&s<toMin(r.end))}
+const toMin=t=>+t.split(':')[0]*60+ +t.split(':')[1];
+function paintSel(){document.querySelectorAll('.slot').forEach(s=>{const i=+s.dataset.i;s.classList.toggle('sel',selStart>=0&&i>=selStart&&i<=selEnd)})}
+function syncForm(){if(selStart<0)return;$('start').value=hhmm(slotMin(selStart));$('end').value=hhmm(slotMin(selEnd+1))}
+
+// ---- 데이터 ----
+async function loadRooms(){
+  const j=await(await fetch('/api/rooms',{cache:'no-store'})).json();rooms=j.rooms;
+  const names=(await(await fetch('/api/room-names')).json()).rooms;
+  const sel=$('room'),cur=sel.value;sel.innerHTML='';names.forEach(n=>sel.add(new Option(n,n)));
+  if(names.includes(cur))sel.value=cur;else if(names.length)sel.value=names[0];
+  if(sel.value!==cur)loadReservations();
+  const box=$('rooms');
+  if(!rooms.length){box.innerHTML='<div class="muted">인증된 카메라가 아직 없습니다. 기기에서 인증코드를 입력하면 여기에 표시됩니다.</div>';return}
+  const t=Date.now();
+  box.innerHTML=rooms.map(r=>{
+    const st=!r.online?'<span class="badge">오프라인</span>':r.occupied?'<span class="badge ok">재실 ('+(r.occupied_by_server?'서버 검출 ':'')+r.faces+'명)</span>':'<span class="badge warn">비어있음</span>';
+    const cr=r.current_reservation;
+    let note='';
+    if(r.online&&cr&&!r.occupied)note='<span class="muted">예약 시간이지만 비어있음</span>';
+    if(r.online&&!cr&&r.occupied)note='<span class="muted">예약 없이 사용 중</span>';
+    let warn='';if(r.online&&r.detect===false)warn='<div style="color:#dc2626;font-size:12px">이 기기는 얼굴 감지(블러)가 꺼져 있습니다 - 보드 PSRAM 설정 확인'+(SERVER_BLUR?' (서버에서 대신 블러 처리 중)':' (서버 블러도 꺼짐: opencv 설치 필요)')+'</div>';
+    warn = '';
+    return '<div class="room'+(r.room===sel.value?' selected':'')+'"><div class="img">'+(r.has_snapshot?'<img src="/snapshot/'+r.mac+'.jpg?t='+t+'">':'<div class="noimg">스냅샷 없음</div>')+'<div class="st">'+st+'</div></div>'
+     +'<div class="body"><div class="name">'+esc(r.room||'(회의실명 없음)')+'</div>'
+     +'<div class="muted">'+(cr?'현재 예약: '+cr.start+'~'+cr.end+' '+esc(cr.reserver)+' · '+esc(cr.purpose):'현재 예약 없음')+'</div>'+(note?'<div>'+note+'</div>':'')+warn
+     +'<div class="muted">'+esc(r.ip)+' · 갱신 '+(r.last_heartbeat_ago==null?'-':r.last_heartbeat_ago+'초 전')+(r.rssi?' · '+r.rssi+' dBm':'')+'</div>'
+     +'<div class="row"><a href="'+r.stream_url+'" target="_blank"><button class="sm sec" type="button">실시간 영상</button></a><a href="'+r.device_url+'" target="_blank"><button class="sm sec" type="button">기기 페이지</button></a><button class="sm" onclick="pickRoom(\''+esc(r.room)+'\')">예약하기</button></div></div></div>'}).join('');
+  $('roomsNote').textContent='· '+j.server_time;
+}
+function pickRoom(n){$('room').value=n;loadReservations();window.scrollTo({top:$('room').getBoundingClientRect().top+window.scrollY-80,behavior:'smooth'})}
+async function loadReservations(){
+  const room=$('room').value,d=$('date').value;
+  document.querySelectorAll('.room').forEach(el=>el.classList.toggle('selected',el.querySelector('.name')?.textContent===room));
+  if(!room){reservations=[];render();return}
+  const j=await(await fetch('/api/reservations?room='+encodeURIComponent(room)+'&date='+d,{cache:'no-store'})).json();
+  reservations=j.reservations;render();
+}
+function render(){
+  if(typeof drag!=='undefined'&&drag)return;   // 드래그 중에는 다시 그리지 않음
+  const now=new Date(),d=$('date').value,todayStr=ymd(now);
+  const isToday=d===todayStr,nowMin=now.getHours()*60+now.getMinutes();
+  const isPast=d<todayStr;
+  document.querySelectorAll('.slot').forEach(s=>{const i=+s.dataset.i;s.classList.toggle('busy',isBusy(i));s.classList.toggle('past',isPast||(isToday&&slotMin(i)+STEP<=nowMin))});
+  $('tlRes').innerHTML=reservations.map(r=>{const l=(toMin(r.start)-OPEN*60)/STEP,w=(toMin(r.end)-toMin(r.start))/STEP;
+    const cur=isToday&&toMin(r.start)<=nowMin&&nowMin<toMin(r.end);
+    return '<div class="res'+(cur?' now':'')+'" data-id="'+r.id+'" style="left:calc('+pct(l)+' + 2px);width:calc('+pct(w)+' - 4px)" title="가운데: 이동 / 양끝: 시간 조절 · '+esc(r.purpose)+'"><b>'+esc(r.reserver)+'</b><span class="t">'+r.start+'~'+r.end+'</span><span>'+esc(r.purpose)+'</span><span class="x" title="예약 취소">✕</span><span class="h hl" title="시작 시간 조절"></span><span class="h hr" title="종료 시간 조절"></span></div>'}).join('');
+  const nowEl=$('tlNow');
+  if(isToday&&nowMin>=OPEN*60&&nowMin<=CLOSE*60){nowEl.style.display='';nowEl.style.left=pct((nowMin-OPEN*60)/STEP)}else nowEl.style.display='none';
+  paintSel();
+  $('resList').innerHTML=reservations.length?reservations.map(r=>'<tr><td>'+r.start+' ~ '+r.end+'</td><td>'+esc(r.room)+'</td><td>'+esc(r.reserver)+'</td><td>'+esc(r.purpose)+'</td><td><button class="sm bad" onclick="delRes(\''+r.id+'\')">취소</button></td></tr>').join(''):'<tr><td colspan="5" class="muted">예약 없음</td></tr>';
+}
+async function reserve(){
+  const m=$('msg');m.className='msg';m.textContent='';
+  const body={room:$('room').value,date:$('date').value,start:$('start').value,end:$('end').value,reserver:$('reserver').value,purpose:$('purpose').value};
+  if(!body.room){m.className='msg bad';m.textContent='회의실을 선택하세요';return}
+  $('btnReserve').disabled=true;
+  try{const r=await fetch('/api/reservations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();
+    if(j.ok){m.className='msg ok';m.textContent='예약되었습니다: '+body.start+'~'+body.end+' '+body.reserver;selStart=selEnd=-1;$('purpose').value='';loadReservations();loadRooms()}
+    else{m.className='msg bad';m.textContent=j.error||'예약 실패'}
+  }catch(e){m.className='msg bad';m.textContent='요청 실패: '+e}
+  $('btnReserve').disabled=false;
+}
+async function delRes(id){const r=await fetch('/api/reservations/'+id,{method:'DELETE'});const j=await r.json();if(!j.ok)alert(j.error||'취소 실패');loadReservations();loadRooms()}
+// toISOString() 은 UTC 기준이라 한국(UTC+9)에서는 날짜가 하루 어긋남 -> 로컬 날짜로 직접 포맷
+function ymd(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')}
+function shiftDate(n){const p=($('date').value||ymd(new Date())).split('-');const d=new Date(+p[0],+p[1]-1,+p[2]);d.setDate(d.getDate()+n);$('date').value=ymd(d);selStart=selEnd=-1;loadReservations()}
+function setToday(){$('date').value=ymd(new Date());selStart=selEnd=-1;loadReservations()}
+$('room').onchange=()=>{selStart=selEnd=-1;loadReservations()};
+$('date').onchange=()=>{selStart=selEnd=-1;loadReservations()};
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+setInterval(()=>{$('clock').textContent=new Date().toLocaleString('ko-KR')},1000);
+loadRooms();setInterval(loadRooms,4000);setInterval(render,60000);
+</script></body></html>"""
+
+
+ADMIN_HTML = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>관리자 - 회의실 카메라</title><style>""" + BASE_CSS + r"""
+.code{font-family:ui-monospace,Menlo,monospace;font-size:18px;letter-spacing:2px;font-weight:700}
+form.inline{display:inline}td form.row{gap:6px}
+</style></head><body>
+<header><h1>클라이언트 관리</h1><span class="muted">{{ server_time }}</span><span class="sp"></span><a href="/">대시보드</a></header>
+<main>
+<div class="card"><h2>등록된 클라이언트 <span class="muted">({{ rows|length }}대 · {{ csv_path }})</span></h2>
+<p class="muted">기기(ESP32-S3-CAM)가 서버에 접속하면 자동으로 여기에 나타납니다. 기기 웹페이지( http://기기IP/ )의 [서버 인증] 란에 아래 인증코드를 입력하고 [인증 시도]를 누르면 인증됩니다.</p>
+{% if not rows %}<div class="muted">아직 접속한 클라이언트가 없습니다. 기기에서 WiFi/서버 IP 설정을 완료하면 자동으로 등록됩니다.</div>{% else %}
+<div style="overflow-x:auto"><table>
+<thead><tr><th>MAC</th><th>IP</th><th>회의실명</th><th>인증코드</th><th>상태</th><th>재실</th><th>처음 접속</th><th>마지막 접속</th><th>작업</th></tr></thead>
+<tbody>
+{% for r in rows %}
+<tr>
+ <td><code>{{ r.mac }}</code></td>
+ <td>{% if r.ip %}<a href="{{ r.device_url }}" target="_blank">{{ r.ip }}</a>{% endif %}</td>
+ <td><form method="post" action="/admin/action" class="row"><input type="hidden" name="mac" value="{{ r.mac }}"><input type="hidden" name="action" value="room">
+     <input type="text" name="room" value="{{ r.room }}" placeholder="회의실명" style="width:150px"><button class="sm sec" type="submit">확인/저장</button></form></td>
+ <td>{% if r.authorized %}<span class="muted">-</span>{% else %}<span class="code">{{ r.auth_code }}</span>{% endif %}</td>
+ <td>{% if r.authorized %}<span class="badge ok">인증됨</span>{% else %}<span class="badge warn">인증 대기</span>{% endif %}
+     {% if r.online %}<span class="badge acc">온라인</span>{% else %}<span class="badge">오프라인</span>{% endif %}</td>
+ <td>{% if r.online %}{% if r.occupied %}<span class="badge ok">재실 ({{ r.faces }})</span>{% else %}<span class="muted">비어있음</span>{% endif %}{% else %}<span class="muted">-</span>{% endif %}</td>
+ <td class="muted">{{ r.first_seen }}</td>
+ <td class="muted">{{ r.last_seen }}</td>
+ <td><div class="row">
+  {% if r.authorized %}<form method="post" action="/admin/action" class="inline"><input type="hidden" name="mac" value="{{ r.mac }}"><input type="hidden" name="action" value="revoke"><button class="sm bad" onclick="return confirm('인증을 취소하고 새 인증코드를 발급합니다. 계속할까요?')">인증 취소</button></form>
+  {% else %}<form method="post" action="/admin/action" class="inline"><input type="hidden" name="mac" value="{{ r.mac }}"><input type="hidden" name="action" value="regen"><button class="sm sec">코드 재발급</button></form>{% endif %}
+  {% if r.stream_url %}<a href="{{ r.stream_url }}" target="_blank"><button class="sm sec" type="button">영상</button></a>{% endif %}
+  <form method="post" action="/admin/action" class="inline"><input type="hidden" name="mac" value="{{ r.mac }}"><input type="hidden" name="action" value="delete"><button class="sm sec" onclick="return confirm('이 클라이언트 기록을 삭제할까요?')">삭제</button></form>
+ </div></td>
+</tr>
+{% endfor %}
+</tbody></table></div>{% endif %}
+</div>
+</main>
+<script>setTimeout(()=>location.reload(),15000)</script>
+</body></html>"""
+
+
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    load_clients()
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    print("회의실 예약 서버 시작: http://%s:%d/  (관리자: /admin)" % (HOST, PORT))
+    print("clients.csv: %s (%d대 등록)" % (CLIENTS_CSV, len(clients)))
+    print("reservations.csv: %s" % RESERVATIONS_CSV)
+    init_face_detector()
+    init_person_detector()
+    print("서버측 검출/블러: " + detector_status())
+    if not ADMIN_PASSWORD:
+        print("주의: ADMIN_PASSWORD 가 설정되지 않아 /admin 에 누구나 접근할 수 있습니다.")
+    app.run(host=HOST, port=PORT, threaded=True, debug=False)
