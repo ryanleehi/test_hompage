@@ -796,7 +796,8 @@ INDEX_HTML = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><met
 .room{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff;display:flex;flex-direction:column}
 .room .img{background:#111;aspect-ratio:4/3;position:relative}.room .img img{width:100%;height:100%;object-fit:cover;display:block}
 .room .img .noimg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:13px}
-.room .img .st{position:absolute;left:8px;top:8px}.room .body{padding:10px 12px;display:grid;gap:6px}.room .name{font-weight:600;font-size:15px}
+.room .img .st{position:absolute;left:8px;top:8px}.room .body{padding:10px 12px;display:grid;gap:6px}.room .name{font-weight:600;font-size:17px;text-align:center}
+.room{cursor:pointer}.room:hover{border-color:var(--acc);box-shadow:0 2px 8px rgba(37,99,235,.15)}
 .room.selected{outline:2px solid var(--acc)}
 .tl-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
 .tl-wrap{width:100%;max-width:100%;overflow:hidden;border:1px solid var(--line);border-radius:8px;background:#fafbfc;user-select:none;-webkit-user-select:none}
@@ -971,9 +972,9 @@ async function loadRooms(){
     if(r.online&&!cr&&r.occupied)note='<span class="muted">예약 없이 사용 중</span>';
     let warn='';if(r.online&&r.detect===false)warn='<div style="color:#dc2626;font-size:12px">이 기기는 얼굴 감지(블러)가 꺼져 있습니다 - 보드 PSRAM 설정 확인'+(SERVER_BLUR?' (서버에서 대신 블러 처리 중)':' (서버 블러도 꺼짐: opencv 설치 필요)')+'</div>';
     warn = '';
-    return '<div class="room'+(r.room===sel.value?' selected':'')+'"><div class="img">'+(r.has_snapshot?'<img src="/snapshot/'+r.mac+'.jpg?t='+t+'">':'<div class="noimg">스냅샷 없음</div>')+'<div class="st">'+st+'</div></div>'
+    return '<div class="room'+(r.room===sel.value?' selected':'')+'" data-room="'+esc(r.room)+'" onclick="if(!event.target.closest(\'a,button\'))pickRoom(this.dataset.room)"><div class="img">'+(r.has_snapshot?'<img src="/snapshot/'+r.mac+'.jpg?t='+t+'">':'<div class="noimg">스냅샷 없음</div>')+'<div class="st">'+st+'</div></div>'
      +'<div class="body"><div class="name">'+esc(r.room||'(회의실명 없음)')+'</div>'
-     +'<div class="muted">'+(cr?'현재 예약: '+cr.start+'~'+cr.end+' '+esc(cr.reserver)+' · '+esc(cr.purpose):'현재 예약 없음')+'</div>'+(note?'<div>'+note+'</div>':'')+warn
+     +'<div class="muted">'+(cr?'현재 예약: '+cr.start+'~'+cr.end+' '+esc(cr.reserver)+' · '+esc(cr.purpose):'현재 예약 없음')+(note?' &nbsp;|&nbsp; '+note:'')+'</div>'+warn
      +'<div class="muted">'+esc(r.ip)+' · 갱신 '+(r.last_heartbeat_ago==null?'-':r.last_heartbeat_ago+'초 전')+(r.rssi?' · '+r.rssi+' dBm':'')+'</div>'
      +'<div class="row"><a href="'+r.stream_url+'" target="_blank"><button class="sm sec" type="button">실시간 영상</button></a><a href="'+r.device_url+'" target="_blank"><button class="sm sec" type="button">기기 페이지</button></a><button class="sm" onclick="pickRoom(\''+esc(r.room)+'\')">예약하기</button></div></div></div>'}).join('');
   $('roomsNote').textContent='· '+j.server_time;
