@@ -1,0 +1,15 @@
+{
+  "name": "meeting-room-server",
+  "version": "1.0.0",
+  "description": "ESP32-S3-CAM + PIR 회의실 재실/예약 통합 관리 서버",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "simulate": "node tools/simulator.js --rooms 4"
+  },
+  "dependencies": {},
+  "license": "MIT"
+}

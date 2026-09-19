@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>회의실 현황 · 통합 대시보드</title>
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>📅</text></svg>">
+</head>
+<body>
+
+<header class="top">
+  <div class="top-left">
+    <h1>회의실 현황</h1>
+    <div class="clock" id="clock">--:--:--</div>
+  </div>
+  <div class="top-right">
+    <input type="date" id="date" aria-label="조회 날짜">
+    <button class="ghost" id="btnToday">오늘</button>
+    <span class="conn" id="conn" title="서버 연결 상태"></span>
+  </div>
+</header>
+
+<section class="summary" id="summary"></section>
+
+<main id="grid" class="grid">
+  <div class="empty">회의실 정보를 불러오는 중…</div>
+</main>
+
+<section class="feed">
+  <h2>최근 활동</h2>
+  <ul id="events"><li class="mut">기록이 없습니다.</li></ul>
+</section>
+
+<footer class="foot">
+  ESP32-S3-CAM + PIR 재실 감지 · 회의실 예약 관리 시스템
+</footer>
+
+<!-- 상세 / 예약 모달 -->
+<div class="modal-back" id="modalBack" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mTitle">
+    <div class="modal-head">
+      <div>
+        <h2 id="mTitle">회의실</h2>
+        <div class="mut" id="mSub"></div>
+      </div>
+      <button class="ghost icon" id="mClose" aria-label="닫기">✕</button>
+    </div>
+
+    <div class="modal-body">
+      <div class="modal-cam">
+        <img id="mShot" alt="회의실 화면">
+        <div class="cam-actions">
+          <a id="mLive" class="ghost btn" target="_blank" rel="noopener">라이브 영상 열기</a>
+          <a id="mDevice" class="ghost btn" target="_blank" rel="noopener">기기 페이지</a>
+        </div>
+        <div class="mut small" id="mCamNote"></div>
+      </div>
+
+      <div class="modal-info">
+        <div id="mState"></div>
+        <div class="tl" id="mTimeline"></div>
+        <h3>예약 목록</h3>
+        <ul id="mList"></ul>
+
+        <h3>새 예약</h3>
+        <div class="form">
+          <div class="frow">
+            <label>시작<input type="time" id="fStart" step="300"></label>
+            <label>종료<input type="time" id="fEnd" step="300"></label>
+          </div>
+          <label>회의 제목<input id="fTitle" placeholder="예: 주간 팀 회의" maxlength="40"></label>
+          <label>예약자<input id="fUser" placeholder="이름 또는 부서" maxlength="24"></label>
+          <button id="fSubmit">예약하기</button>
+          <div class="msg" id="fMsg"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
