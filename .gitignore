@@ -1,6 +1,7 @@
 # 런타임 데이터 (기기 토큰/예약 내역/스냅샷 - 저장소에 올리지 않음)
 clients.csv
 reservations.csv
+activity.csv
 snapshots/
 *.tmp
 

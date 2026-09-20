@@ -36,6 +36,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CLIENTS_CSV = os.path.join(BASE_DIR, "clients.csv")
 RESERVATIONS_CSV = os.path.join(BASE_DIR, "reservations.csv")
 ROOMS_JSON = os.path.join(BASE_DIR, "rooms.json")            # 층 목록 + 회의실 기본 정보(층/TV/의자/테이블/화이트보드)
+ACTIVITY_CSV = os.path.join(BASE_DIR, "activity.csv")        # 예약 생성/수정/삭제 로그
 SNAPSHOT_DIR = os.path.join(BASE_DIR, "snapshots")
 
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -389,6 +390,34 @@ def save_clients():
         for row in clients.values():
             w.writerow(row)
     os.replace(tmp, CLIENTS_CSV)
+
+
+LOG_FIELDS = ["ts", "action", "room", "date", "start", "end", "reserver", "purpose", "detail", "ip", "id"]
+
+
+def log_activity(action, r, detail="", rid=None):
+    """예약 활동 로그 한 줄 추가 (action: 예약 / 수정 / 삭제)"""
+    row = {"ts": now_str(), "action": action, "room": r.get("room", ""), "date": r.get("date", ""),
+           "start": r.get("start", ""), "end": r.get("end", ""), "reserver": r.get("reserver", ""),
+           "purpose": r.get("purpose", ""), "detail": detail, "ip": request.remote_addr or "", "id": rid or r.get("id", "")}
+    new = not os.path.exists(ACTIVITY_CSV)
+    try:
+        with open(ACTIVITY_CSV, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore")
+            if new:
+                w.writeheader()
+            w.writerow(row)
+    except OSError as e:
+        print("activity.csv 기록 실패: %s" % e, flush=True)
+
+
+def load_activity(limit=500):
+    if not os.path.exists(ACTIVITY_CSV):
+        return []
+    with open(ACTIVITY_CSV, newline="", encoding="utf-8") as f:
+        rows = [dict(r) for r in csv.DictReader(f)]
+    rows.reverse()                       # 최신순
+    return rows[:limit]
 
 
 def load_reservations():
@@ -755,6 +784,7 @@ def api_reservations_create():
                "purpose": purpose, "reserver": reserver, "link": link, "created_at": now_str()}
         rows.append(new)
         save_reservations(rows)
+        log_activity("예약", new)
     print("[RESERVE] %s %s %s~%s %s (%s)" % (room, day, start, end, reserver, purpose), flush=True)
     return jsonify(ok=True, reservation=new)
 
@@ -785,8 +815,18 @@ def api_reservations_update(rid):
             if r["id"] != rid and r["room"] == cur["room"] and r["date"] == day and to_min(start) < to_min(r["end"]) and to_min(r["start"]) < to_min(end):
                 return jsonify(ok=False, error="이미 예약된 시간과 겹칩니다 (%s~%s %s)" % (r["start"], r["end"], r["reserver"])), 409
         old = "%s %s~%s" % (cur["date"], cur["start"], cur["end"])
+        changes = []
+        if (cur["date"], cur["start"], cur["end"]) != (day, start, end):
+            changes.append("시간 %s → %s %s~%s" % (old, day, start, end))
+        if cur["reserver"] != reserver:
+            changes.append("예약자 %s → %s" % (cur["reserver"], reserver))
+        if cur["purpose"] != purpose:
+            changes.append("목적 %s → %s" % (cur["purpose"], purpose))
+        if cur.get("link", "") != link:
+            changes.append("링크 " + ("추가" if not cur.get("link") else ("삭제" if not link else "변경")))
         cur.update(date=day, start=start, end=end, purpose=purpose, reserver=reserver, link=link)
         save_reservations(rows)
+        log_activity("수정", cur, ", ".join(changes) or "변경 없음")
     print("[MOVE] %s %s -> %s %s~%s (%s)" % (cur["room"], old, day, start, end, reserver), flush=True)
     return jsonify(ok=True, reservation=cur)
 
@@ -798,8 +838,85 @@ def api_reservations_delete(rid):
         keep = [r for r in rows if r["id"] != rid]
         if len(keep) == len(rows):
             return jsonify(ok=False, error="예약을 찾을 수 없습니다"), 404
+        gone = next(r for r in rows if r["id"] == rid)
         save_reservations(keep)
+        log_activity("삭제", gone)
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------------------
+# 대시보드 통계 / 활동 로그
+# ---------------------------------------------------------------------------
+@app.get("/api/stats")
+def api_stats():
+    """period: all | 30 | 90 | year  (예약 날짜 기준)"""
+    period = request.args.get("period", "all")
+    today = date.today()
+    with lock:
+        rows = load_reservations()
+        occupied = sum(1 for mac in clients if client_view(mac)["occupied"])
+        cams = sum(1 for mac in clients if clients[mac].get("authorized") == "1")
+    def in_period(r):
+        try:
+            d = datetime.strptime(r["date"], "%Y-%m-%d").date()
+        except ValueError:
+            return False
+        if period == "30":
+            return (today - d).days <= 30 and d <= today
+        if period == "90":
+            return (today - d).days <= 90 and d <= today
+        if period == "year":
+            return d.year == today.year
+        return True
+    sel = [r for r in rows if in_period(r)]
+    durs = [to_min(r["end"]) - to_min(r["start"]) for r in sel]
+    total_min = sum(durs)
+    by_dow = [0] * 7                       # 월..일
+    by_hour = [0] * (CLOSE_HOUR - OPEN_HOUR)   # 해당 시간대에 진행된 회의 수
+    by_room = {}
+    by_month = {}
+    for r in sel:
+        d = datetime.strptime(r["date"], "%Y-%m-%d").date()
+        by_dow[d.weekday()] += 1
+        by_room[r["room"]] = by_room.get(r["room"], 0) + 1
+        by_month[d.strftime("%Y-%m")] = by_month.get(d.strftime("%Y-%m"), 0) + 1
+        for h in range(OPEN_HOUR, CLOSE_HOUR):
+            if to_min(r["start"]) < (h + 1) * 60 and h * 60 < to_min(r["end"]):
+                by_hour[h - OPEN_HOUR] += 1
+    # 월별: 최근 12개월 (없는 달은 0)
+    months = []
+    y, m = today.year, today.month
+    for _ in range(12):
+        months.append("%04d-%02d" % (y, m))
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    months.reverse()
+    this_month = today.strftime("%Y-%m")
+    return jsonify(
+        period=period, total=len(sel), total_minutes=total_min,
+        avg_minutes=round(total_min / len(sel)) if sel else 0,
+        today=sum(1 for r in rows if r["date"] == today.isoformat()),
+        this_month=sum(1 for r in rows if r["date"].startswith(this_month)),
+        occupied_rooms=occupied, camera_rooms=cams,
+        by_dow=by_dow, by_hour=by_hour, hours=list(range(OPEN_HOUR, CLOSE_HOUR)),
+        by_month=[{"month": k, "count": by_month.get(k, 0)} for k in months],
+        by_room=sorted([{"room": k, "count": v} for k, v in by_room.items()], key=lambda x: -x["count"])[:8],
+        reservers=sorted([{"name": k, "count": v} for k, v in
+                          {r["reserver"]: sum(1 for x in sel if x["reserver"] == r["reserver"]) for r in sel}.items()],
+                         key=lambda x: -x["count"])[:5],
+    )
+
+
+@app.get("/api/log")
+def api_log():
+    try:
+        limit = max(1, min(2000, int(request.args.get("limit", "300"))))
+    except ValueError:
+        limit = 300
+    with lock:
+        rows = load_activity(limit)
+    return jsonify(log=rows)
 
 
 # ---------------------------------------------------------------------------
@@ -891,7 +1008,7 @@ INDEX_HTML = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><met
 .rooms{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
 /* 탭 */
 .tabs{display:flex;gap:4px;max-width:1200px;margin:14px auto -16px;padding:0 18px;flex-wrap:wrap;align-items:flex-end}
-.tab{padding:9px 18px;border:1px solid var(--line);border-bottom:none;border-radius:9px 9px 0 0;background:#e9edf2;color:var(--muted);cursor:pointer;font-weight:600;font-size:14px}
+.tab{padding:9px 18px;border:1px solid var(--line);border-bottom:none;border-radius:9px 9px 0 0;background:#e9edf2;color:var(--muted);cursor:pointer;font-weight:600;font-size:14px;line-height:20px;height:39px;box-sizing:border-box}
 .tab:hover{background:#f3f5f8}.tab.active{background:#fff;color:var(--fg);box-shadow:0 -2px 0 var(--acc) inset}.tab.cfg{margin-left:6px}
 .tabclock{margin-left:auto;align-self:center;font-size:15px;font-weight:600;color:var(--fg);padding:0 10px 6px;white-space:nowrap;display:flex;align-items:center}
 .tabclock .dow{color:var(--acc)}.tabclock .sun{color:var(--bad)}
@@ -919,6 +1036,19 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 .modal-box input[type=text],.modal-box input[type=date],.modal-box select{width:100%}
 /* 설정 */
 .chips{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 12px}.chip{background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:4px 10px;font-size:13px;display:flex;gap:6px;align-items:center}.chip b{cursor:pointer;color:var(--bad)}
+/* 대시보드 */
+.viz-root{--surface-1:#fcfcfb;--series-1:#2a78d6;--series-1-soft:#cde2fb;--grid:#e6e8eb;--text-secondary:#52514e}
+.subtabs{display:flex;gap:6px;margin-bottom:14px}.subtab{padding:6px 14px;border-radius:999px;background:#e9edf2;cursor:pointer;font-size:13px;font-weight:600;color:var(--muted)}.subtab.active{background:var(--acc);color:#fff}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+.tile{background:var(--surface-1);border:1px solid var(--line);border-radius:10px;padding:12px 14px}.tile .lbl{font-size:12px;color:var(--muted)}.tile .val{font-size:26px;font-weight:600;margin-top:4px;font-variant-numeric:tabular-nums}.tile .sub{font-size:12px;color:var(--muted);margin-top:2px}
+.tile.hero .val{font-size:40px}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px}
+.chart{background:var(--surface-1);border:1px solid var(--line);border-radius:10px;padding:12px 14px;min-width:0}.chart h3{font-size:14px;margin:0 0 2px}.chart .sub{font-size:12px;color:var(--muted);margin-bottom:6px}
+.chart svg{width:100%;height:190px;display:block;overflow:visible}.chart .bar{fill:var(--series-1);cursor:pointer}.chart .bar:hover{fill:#1c5cab}
+.chart .grid{stroke:var(--grid);stroke-width:1}.chart .axis{fill:var(--text-secondary);font-size:11px}.chart .vl{fill:var(--fg);font-size:11px;font-weight:600}
+.chart details{margin-top:6px}.chart summary{font-size:12px;color:var(--muted);cursor:pointer}.chart table td,.chart table th{padding:3px 6px;font-size:12px}
+.viz-tip{position:fixed;z-index:60;background:#111827;color:#fff;font-size:12px;padding:5px 9px;border-radius:6px;pointer-events:none;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.3)}
+.logtable td{font-size:13px;vertical-align:top}.logtable .act{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;color:#fff}.act.c{background:var(--acc)}.act.u{background:var(--warn)}.act.d{background:var(--bad)}
 .cfgtable input[type=text]{width:100%}.cfgtable input[type=number]{width:70px;padding:6px 8px;border:1px solid var(--line);border-radius:6px}.cfgtable select{padding:6px 8px}
 .room{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff;display:flex;flex-direction:column}
 .room .img{background:#111;aspect-ratio:4/3;position:relative}.room .img img{width:100%;height:100%;object-fit:cover;display:block}
@@ -1007,6 +1137,29 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 </div>
 <div class="msg" id="msg"></div>
 </div>
+</div>
+</div>
+
+<div id="viewDash" class="card viz-root" hidden>
+<div class="row" style="justify-content:space-between;margin-bottom:10px"><h2 style="margin:0">📊 대시보드</h2>
+ <div class="subtabs" style="margin:0"><span class="subtab active" data-sub="stats" onclick="setDashSub('stats')">통계</span><span class="subtab" data-sub="log" onclick="setDashSub('log')">로그</span></div></div>
+<div id="dashStats">
+ <div class="row" style="margin-bottom:12px"><span class="muted">기간</span>
+  <select id="statPeriod" onchange="loadStats()"><option value="all">전체</option><option value="30">최근 30일</option><option value="90">최근 90일</option><option value="year">올해</option></select>
+  <span class="muted" id="statNote"></span></div>
+ <div class="tiles" id="tiles"></div>
+ <div class="charts">
+  <div class="chart"><h3>요일별 회의 수</h3><div class="sub">선택한 기간의 예약 건수</div><div id="chDow"></div></div>
+  <div class="chart"><h3>시간대별 회의 빈도</h3><div class="sub">그 시간에 진행 중이던 회의 수</div><div id="chHour"></div></div>
+  <div class="chart"><h3>월별 회의 수</h3><div class="sub">최근 12개월</div><div id="chMonth"></div></div>
+  <div class="chart"><h3>회의실별 회의 수</h3><div class="sub">상위 8개</div><div id="chRoom"></div></div>
+ </div>
+</div>
+<div id="dashLog" hidden>
+ <div class="row" style="margin-bottom:10px"><span class="muted">예약 / 수정 / 삭제 활동 기록 (최신순)</span>
+  <select id="logFilter" onchange="renderLog()"><option value="">전체</option><option value="예약">예약</option><option value="수정">수정</option><option value="삭제">삭제</option></select>
+  <button class="sm sec" onclick="loadLog()">새로고침</button></div>
+ <div style="overflow-x:auto"><table class="logtable"><thead><tr><th>시각</th><th>동작</th><th>회의실</th><th>회의 날짜·시간</th><th>예약자</th><th>회의 목적</th><th>상세</th><th>IP</th></tr></thead><tbody id="logBody"><tr><td colspan="8" class="muted">기록 없음</td></tr></tbody></table></div>
 </div>
 </div>
 
@@ -1172,6 +1325,7 @@ async function loadRooms(){
   $('roomsNote').textContent='· '+j.server_time;fitCols();
 }
 function fitCols(){}   // 왼쪽 카드 높이는 grid 가 오른쪽(정보/목록 + 예약) 블록 높이에 맞춰 늘림
+window.addEventListener('resize',()=>{if(currentTab==='dash')loadStats()});
 function pickRoom(n){$('room').value=n;loadReservations();window.scrollTo({top:$('room').getBoundingClientRect().top+window.scrollY-80,behavior:'smooth'})}
 // 날짜를 "2026.09.20.일" 형식으로 표시 (input[type=date] 는 표시 형식을 바꿀 수 없어 텍스트로 대신 보여줌)
 function updateDow(){const v=$('date').value;const box=$('dateText').parentElement;if(!v){$('dateText').textContent='';return}
@@ -1234,12 +1388,12 @@ async function loadConfig(){try{config=await(await fetch('/api/config',{cache:'n
   if(!startedAtFavorite){startedAtFavorite=true;const fav=config.favorite;
     if(fav&&config.rooms[fav]){const fl=config.rooms[fav].floor;currentTab=(fl&&config.floors.includes(fl))?fl:'all';$('room').innerHTML='';$('room').add(new Option(fav,fav));$('room').value=fav}}
   renderTabs()}
-function renderTabs(){const t=$('tabs');const tabs=[['all','전체'],...config.floors.map(f=>[f,f]),['settings','⚙ 설정']];
+function renderTabs(){const t=$('tabs');const tabs=[['all','전체'],...config.floors.map(f=>[f,f]),['dash','대시보드'],['settings','⚙ 설정']];
   if(!tabs.some(x=>x[0]===currentTab))currentTab='all';
-  t.innerHTML=tabs.map(([id,label])=>(id==='settings'?'<div class="tabclock" id="tabClock"></div>':'')+'<div class="tab'+(id===currentTab?' active':'')+(id==='settings'?' cfg':'')+'" data-tab="'+esc(id)+'">'+esc(label)+'</div>').join('');tick();
+  t.innerHTML=tabs.map(([id,label])=>(id==='dash'?'<div class="tabclock" id="tabClock"></div>':'')+'<div class="tab'+(id===currentTab?' active':'')+(id==='settings'||id==='dash'?' cfg':'')+'" data-tab="'+esc(id)+'">'+esc(label)+'</div>').join('');tick();
   t.querySelectorAll('.tab').forEach(el=>el.onclick=()=>setTab(el.dataset.tab))}
-function setTab(id){currentTab=id;renderTabs();const st=id==='settings';$('viewSettings').hidden=!st;$('viewRooms').style.display=st?'none':'';
-  if(st)renderSettings();else{$('room').value='';loadRooms()}}
+function setTab(id){currentTab=id;renderTabs();const st=id==='settings',dash=id==='dash';$('viewSettings').hidden=!st;$('viewDash').hidden=!dash;$('viewRooms').style.display=(st||dash)?'none':'';
+  if(st)renderSettings();else if(dash){loadStats();loadLog()}else{$('room').value='';loadRooms()}}
 
 // ---- 가운데: 회의실 기본 정보 ----
 function renderInfo(){const name=$('room').value;$('infoName').textContent=name?'· '+name:'';const box=$('roomInfo');
@@ -1258,7 +1412,9 @@ function renderInfo(){const name=$('room').value;$('infoName').textContent=name?
    +'<dt>화상회의 장비</dt><dd>'+yn(i.vc)+'</dd>'
    +'<dt>비고</dt><dd>'+(i.note?esc(i.note):'<span class="no">-</span>')+'</dd>'
    +'<dt>현재 상태</dt><dd>'+st+'</dd>'
-   +'<dt>현재 예약</dt><dd>'+(cr?cr.start+'~'+cr.end+' '+esc(cr.reserver)+' ('+esc(cr.purpose)+')':'<span class="no">없음</span>')+'</dd>'
+   +'<dt>현재 예약</dt><dd>'+(cr?cr.start+' ~ '+cr.end:'<span class="no">없음</span>')+'</dd>'
+   +'<dt>예약자</dt><dd>'+(cr?esc(cr.reserver):'<span class="no">-</span>')+'</dd>'
+   +'<dt>회의 목적</dt><dd>'+(cr?esc(cr.purpose):'<span class="no">-</span>')+'</dd>'
    +'</dl><p class="muted" style="margin:12px 0 0"><a href="#" onclick="setTab(\'settings\');return false">⚙ 설정에서 정보 수정</a></p>'}
 
 // ---- 예약 수정 모달 (막대 더블클릭 / 목록의 [수정]) ----
@@ -1320,6 +1476,57 @@ const ICON_EDIT='<button class="ib edit" title="수정" onclick="openEdit(\'%ID%
 const ICON_DEL='<button class="ib del" title="예약 취소" onclick="delRes(\'%ID%\')">'+SVG_DEL+'</button>';
 // 링크 아이콘: 링크가 있으면 활성(클릭 시 새 탭으로 열림), 없으면 회색
 function linkIcon(url){if(!url)return '<span class="lnk off ib" title="링크 없음">'+SVG_LINK+'</span>';const u=esc(url);return '<a class="lnk on ib" href="'+u+'" target="_blank" rel="noopener" title="'+u+'" onclick="event.stopPropagation()">'+SVG_LINK+'</a>'}
+
+// ---- 대시보드: 통계 카드 + 차트 + 로그 ----
+let logRows=[];
+function setDashSub(k){document.querySelectorAll('.subtab').forEach(e=>e.classList.toggle('active',e.dataset.sub===k));$('dashStats').hidden=k!=='stats';$('dashLog').hidden=k!=='log'}
+const fmtMin=m=>m>=60?(Math.floor(m/60)+'시간'+(m%60?' '+m%60+'분':'')):m+'분';
+async function loadStats(){const p=$('statPeriod').value;let st;try{st=await(await fetch('/api/stats?period='+p,{cache:'no-store'})).json()}catch(e){return}
+  const pn={all:'전체 기간',30:'최근 30일',90:'최근 90일',year:'올해'}[p];$('statNote').textContent='· '+pn+' 기준';
+  $('tiles').innerHTML=[
+   ['hero','사용 중 회의실',st.occupied_rooms+'<span style="font-size:16px;color:var(--muted)"> / '+st.camera_rooms+'</span>','카메라 기준 현재 재실'],
+   ['','오늘 회의',st.today+'건',''],['','이번 달 회의',st.this_month+'건',''],
+   ['','누적 회의 건수',st.total+'건',pn],['','평균 회의 시간',fmtMin(st.avg_minutes),pn],['','총 회의 시간',fmtMin(st.total_minutes),pn]
+  ].map(([c,l,v,sub])=>'<div class="tile '+c+'"><div class="lbl">'+l+'</div><div class="val">'+v+'</div>'+(sub?'<div class="sub">'+sub+'</div>':'')+'</div>').join('');
+  barChart($('chDow'),['월','화','수','목','금','토','일'],st.by_dow,'건');
+  barChart($('chHour'),st.hours.map(h=>h+'시'),st.by_hour,'건');
+  barChart($('chMonth'),st.by_month.map(x=>(+x.month.slice(5))+'월'),st.by_month.map(x=>x.count),'건',st.by_month.map(x=>x.month.replace('-','년 ')+'월'));
+  hbarChart($('chRoom'),st.by_room.map(x=>x.room),st.by_room.map(x=>x.count),'건')}
+// 단일 계열 세로 막대 차트 (SVG): 막대 <=24px, 위쪽 4px 라운드, 하이라인 격자, 최대값만 직접 라벨, 마우스 오버 툴팁, 표 보기
+function barChart(box,labels,values,unit,fullLabels){   // fullLabels: 툴팁/표에 쓸 긴 이름 (선택)const W=Math.max(300,box.clientWidth||460),H=190,pl=34,pr=8,pt=14,pb=26;const n=labels.length;
+  if(!n){box.innerHTML='<div class="muted" style="padding:40px 0;text-align:center">데이터 없음</div>';return}
+  const max=Math.max(1,...values);const step=niceStep(max);const top=Math.ceil(max/step)*step;
+  const iw=W-pl-pr,ih=H-pt-pb,band=iw/n,bw=Math.min(24,band*0.6);const y=v=>pt+ih-(v/top)*ih;
+  let g='';for(let v=0;v<=top;v+=step){g+='<line class="grid" x1="'+pl+'" x2="'+(W-pr)+'" y1="'+y(v)+'" y2="'+y(v)+'"/><text class="axis" x="'+(pl-6)+'" y="'+(y(v)+4)+'" text-anchor="end">'+v+'</text>'}
+  const maxI=values.indexOf(max);let bars='';
+  values.forEach((v,i)=>{const x=pl+band*i+(band-bw)/2,yy=y(v),h=pt+ih-yy;const r=Math.min(4,h);
+    const d=h<=0?'':'M'+x+' '+(pt+ih)+' V'+(yy+r)+' a'+r+' '+r+' 0 0 1 '+r+' -'+r+' H'+(x+bw-r)+' a'+r+' '+r+' 0 0 1 '+r+' '+r+' V'+(pt+ih)+' Z';
+    bars+='<rect x="'+(pl+band*i)+'" y="'+pt+'" width="'+band+'" height="'+ih+'" fill="transparent" data-i="'+i+'"/>'+(d?'<path class="bar" d="'+d+'" data-i="'+i+'"/>':'');
+    if(i===maxI&&v>0)bars+='<text class="vl" x="'+(x+bw/2)+'" y="'+(yy-4)+'" text-anchor="middle">'+v+'</text>';
+    bars+='<text class="axis" x="'+(pl+band*i+band/2)+'" y="'+(H-pb+14)+'" text-anchor="middle">'+esc(String(labels[i]))+'</text>'});
+  box.innerHTML='<svg viewBox="0 0 '+W+' '+H+'">'+g+'<line class="grid" x1="'+pl+'" x2="'+(W-pr)+'" y1="'+(pt+ih)+'" y2="'+(pt+ih)+'" style="stroke:#c9ccd1"/>'+bars+'</svg>'
+   +'<details><summary>표로 보기</summary><table><thead><tr><th>구분</th><th>값</th></tr></thead><tbody>'+labels.map((l,i)=>'<tr><td>'+esc((fullLabels||labels)[i])+'</td><td>'+values[i]+unit+'</td></tr>').join('')+'</tbody></table></details>';
+  const svg=box.querySelector('svg');svg.addEventListener('mousemove',e=>{const t=e.target.closest('[data-i]');if(!t){hideVizTip();return}const i=+t.dataset.i;showVizTip(e.clientX,e.clientY,(fullLabels||labels)[i]+': '+values[i]+unit)});
+  svg.addEventListener('mouseleave',hideVizTip)}
+// 가로 막대 차트 (긴 이름용): 왼쪽에 이름, 막대 끝에 값
+function hbarChart(box,labels,values,unit){const n=labels.length;if(!n){box.innerHTML='<div class="muted" style="padding:40px 0;text-align:center">데이터 없음</div>';return}
+  const W=Math.max(300,box.clientWidth||460),rowH=26,pl=110,pr=40,pt=6,H=pt+rowH*n+6;const max=Math.max(1,...values);const iw=W-pl-pr;const bh=18;
+  let bars='';values.forEach((v,i)=>{const y=pt+rowH*i+(rowH-bh)/2,w=Math.max(0,v/max*iw),r=Math.min(4,w);
+    const d=w<=0?'':'M'+pl+' '+y+' H'+(pl+w-r)+' a'+r+' '+r+' 0 0 1 '+r+' '+r+' V'+(y+bh-r)+' a'+r+' '+r+' 0 0 1 -'+r+' '+r+' H'+pl+' Z';
+    const lab=String(labels[i]);bars+='<rect x="0" y="'+(pt+rowH*i)+'" width="'+W+'" height="'+rowH+'" fill="transparent" data-i="'+i+'"/>'+(d?'<path class="bar" d="'+d+'" data-i="'+i+'"/>':'')
+     +'<text class="axis" x="'+(pl-8)+'" y="'+(y+bh/2+4)+'" text-anchor="end">'+esc(lab.length>9?lab.slice(0,9)+'…':lab)+'</text>'
+     +'<text class="vl" x="'+(pl+w+6)+'" y="'+(y+bh/2+4)+'">'+v+'</text>'});
+  box.innerHTML='<svg viewBox="0 0 '+W+' '+H+'" style="height:'+H+'px">'+'<line class="grid" x1="'+pl+'" x2="'+pl+'" y1="'+pt+'" y2="'+(H-6)+'" style="stroke:#c9ccd1"/>'+bars+'</svg>'
+   +'<details><summary>표로 보기</summary><table><thead><tr><th>회의실</th><th>값</th></tr></thead><tbody>'+labels.map((l,i)=>'<tr><td>'+esc(l)+'</td><td>'+values[i]+unit+'</td></tr>').join('')+'</tbody></table></details>';
+  const svg=box.querySelector('svg');svg.addEventListener('mousemove',e=>{const t=e.target.closest('[data-i]');if(!t){hideVizTip();return}const i=+t.dataset.i;showVizTip(e.clientX,e.clientY,labels[i]+': '+values[i]+unit)});svg.addEventListener('mouseleave',hideVizTip)}
+function niceStep(max){const raw=max/4;const p=Math.pow(10,Math.floor(Math.log10(raw)));const f=raw/p;return (f<=1?1:f<=2?2:f<=5?5:10)*p}
+function showVizTip(x,y,text){let t=$('vizTip');if(!t){t=document.createElement('div');t.id='vizTip';t.className='viz-tip';document.body.appendChild(t)}t.textContent=text;t.style.left=(x+12)+'px';t.style.top=(y-30)+'px';t.style.display=''}
+function hideVizTip(){const t=$('vizTip');if(t)t.style.display='none'}
+async function loadLog(){try{logRows=(await(await fetch('/api/log?limit=500',{cache:'no-store'})).json()).log}catch(e){logRows=[]}renderLog()}
+function renderLog(){const f=$('logFilter').value;const rows=logRows.filter(r=>!f||r.action===f);
+  $('logBody').innerHTML=rows.length?rows.map(r=>{const c=r.action==='예약'?'c':r.action==='수정'?'u':'d';
+    return '<tr><td style="white-space:nowrap">'+esc(r.ts)+'</td><td><span class="act '+c+'">'+esc(r.action)+'</span></td><td>'+esc(r.room)+'</td><td style="white-space:nowrap">'+esc(r.date)+' '+esc(r.start)+'~'+esc(r.end)+'</td><td>'+esc(r.reserver)+'</td><td>'+esc(r.purpose)+'</td><td class="muted">'+esc(r.detail)+'</td><td class="muted">'+esc(r.ip)+'</td></tr>'}).join('')
+   :'<tr><td colspan="8" class="muted">기록 없음</td></tr>'}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function tick(){const n=new Date();$('clock').textContent=n.toLocaleString('ko-KR');const c=$('tabClock');if(!c)return;
   const dn=['일','월','화','수','목','금','토'][n.getDay()];const hh=String(n.getHours()).padStart(2,'0'),mm=String(n.getMinutes()).padStart(2,'0'),ss=String(n.getSeconds()).padStart(2,'0');
@@ -1328,7 +1535,7 @@ function tick(){const n=new Date();$('clock').textContent=n.toLocaleString('ko-K
   c.dataset.d=ymd(n);
   c.innerHTML='<span class="date">'+ymd(n).replace(/-/g,'.')+'.<span class="dow'+(n.getDay()===0?' sun':'')+'">'+dn+'</span></span><span class="sep">|</span><span class="time">'+hh+':'+mm+':'+ss+'</span>'}
 setInterval(tick,1000);
-loadConfig().then(loadRooms);setInterval(()=>{if(currentTab!=='settings')loadRooms()},4000);setInterval(render,60000);
+loadConfig().then(loadRooms);setInterval(()=>{if(currentTab!=='settings'&&currentTab!=='dash')loadRooms()},4000);setInterval(render,60000);
 </script></body></html>"""
 
 
