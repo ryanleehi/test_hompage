@@ -49,7 +49,15 @@ MAX_AUTH_FAILS = 5                            # 연속 실패 시 인증코드 �
 
 CLIENT_FIELDS = ["mac", "ip", "room", "auth_code", "authorized", "token",
                  "first_seen", "last_seen", "fail_count"]
-RES_FIELDS = ["id", "room", "date", "start", "end", "purpose", "reserver", "created_at"]
+RES_FIELDS = ["id", "room", "date", "start", "end", "purpose", "reserver", "link", "created_at"]   # link: 줌/구글밋 등 회의 링크
+
+
+def norm_link(v):
+    """회의 링크 정리: 비어 있으면 "", 스킴이 없으면 https:// 를 붙임"""
+    v = (v or "").strip()
+    if v and not v.lower().startswith(("http://", "https://")):
+        v = "https://" + v
+    return v
 
 # ---------------------------------------------------------------------------
 # 서버측 얼굴 블러 안전장치 (선택):  pip install opencv-python-headless numpy
@@ -387,7 +395,10 @@ def load_reservations():
     if not os.path.exists(RESERVATIONS_CSV):
         return []
     with open(RESERVATIONS_CSV, newline="", encoding="utf-8") as f:
-        return [dict(r) for r in csv.DictReader(f)]
+        rows = [dict(r) for r in csv.DictReader(f)]
+    for r in rows:                      # 예전 파일(link 컬럼 없음) 호환
+        r["link"] = r.get("link") or ""
+    return rows
 
 
 def save_reservations(rows):
@@ -718,6 +729,7 @@ def api_reservations_create():
     start = (d.get("start") or "").strip()
     end = (d.get("end") or "").strip()
     purpose = (d.get("purpose") or "").strip()
+    link = norm_link(d.get("link"))
     reserver = (d.get("reserver") or "").strip()
 
     slots = slot_times()
@@ -740,7 +752,7 @@ def api_reservations_create():
             if r["room"] == room and r["date"] == day and to_min(start) < to_min(r["end"]) and to_min(r["start"]) < to_min(end):
                 return jsonify(ok=False, error="이미 예약된 시간과 겹칩니다 (%s~%s %s)" % (r["start"], r["end"], r["reserver"])), 409
         new = {"id": uuid.uuid4().hex[:10], "room": room, "date": day, "start": start, "end": end,
-               "purpose": purpose, "reserver": reserver, "created_at": now_str()}
+               "purpose": purpose, "reserver": reserver, "link": link, "created_at": now_str()}
         rows.append(new)
         save_reservations(rows)
     print("[RESERVE] %s %s %s~%s %s (%s)" % (room, day, start, end, reserver, purpose), flush=True)
@@ -761,6 +773,7 @@ def api_reservations_update(rid):
         end = (d.get("end") or cur["end"]).strip()
         day = (d.get("date") or cur["date"]).strip()
         purpose = (d.get("purpose") or cur["purpose"]).strip()
+        link = norm_link(d["link"]) if "link" in d else cur.get("link", "")
         reserver = (d.get("reserver") or cur["reserver"]).strip()
         if not valid_date(day):
             return jsonify(ok=False, error="날짜 형식이 올바르지 않습니다"), 400
@@ -772,7 +785,7 @@ def api_reservations_update(rid):
             if r["id"] != rid and r["room"] == cur["room"] and r["date"] == day and to_min(start) < to_min(r["end"]) and to_min(r["start"]) < to_min(end):
                 return jsonify(ok=False, error="이미 예약된 시간과 겹칩니다 (%s~%s %s)" % (r["start"], r["end"], r["reserver"])), 409
         old = "%s %s~%s" % (cur["date"], cur["start"], cur["end"])
-        cur.update(date=day, start=start, end=end, purpose=purpose, reserver=reserver)
+        cur.update(date=day, start=start, end=end, purpose=purpose, reserver=reserver, link=link)
         save_reservations(rows)
     print("[MOVE] %s %s -> %s %s~%s (%s)" % (cur["room"], old, day, start, end, reserver), flush=True)
     return jsonify(ok=True, reservation=cur)
@@ -885,13 +898,14 @@ INDEX_HTML = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><met
 .tabclock .sep{color:#c7ccd3;font-weight:400;margin:0 10px}
 .tabclock .time{display:inline-block;width:5em;text-align:left;font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,Consolas,monospace}   /* 고정폭: 초가 바뀌어도 날짜 위치가 움직이지 않음 */
 /* 층 탭 화면: 왼쪽 카메라 | 가운데 회의실 정보 | 오른쪽 예약 목록 */
-.cols3{display:grid;grid-template-columns:minmax(270px,1fr) minmax(240px,.85fr) minmax(300px,1.15fr);grid-template-rows:auto 1fr;gap:16px}
+.cols3{display:grid;grid-template-columns:minmax(270px,1fr) minmax(200px,.68fr) minmax(340px,1.32fr);grid-template-rows:auto 1fr;gap:16px}   /* 회의실 정보 열을 80% 로 줄이고 그만큼 예약 목록 열을 넓힘 */
 .cols3>.cams{grid-row:1/3;grid-column:1}          /* 회의실 현황: 왼쪽 열 전체 높이 */
 .cols3>.resv{grid-column:2/4}                      /* 예약 섹션: 회의실 정보 + 예약 목록 아래, 그 두 카드 폭만큼 */
 .cols3>.card{min-width:0;display:flex;flex-direction:column}.cols3 .rooms{grid-template-columns:1fr;align-content:start}
 /* 왼쪽(회의실 현황)/오른쪽(예약 목록) 내용은 절대 배치 -> 행 높이에 영향을 주지 않고, 행 높이는 가운데 '회의실 정보' 카드의 내용 높이로 결정됨 */
 .cols3 .fill{flex:1 1 auto;position:relative;min-height:160px}
-tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical-align:1px}.cols3 .fill>.scroll{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;padding-right:4px}
+tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical-align:1px}
+#resList td:nth-child(2){white-space:nowrap}#resList td:nth-child(4){text-align:center;width:30px}#resList td:nth-child(5){white-space:nowrap;width:56px}.cols3 .fill>.scroll{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;padding-right:4px}
 .cols3 .fill>.scroll::-webkit-scrollbar{width:8px}.cols3 .fill>.scroll::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:4px}
 @media (max-width:1000px){.cols3{grid-template-columns:1fr;grid-template-rows:none}.cols3>.cams{grid-row:auto;grid-column:auto}.cols3>.resv{grid-column:auto}.cols3 .fill{min-height:0}.cols3 .fill>.scroll{position:static;max-height:60vh}}
 .info{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px}.info dt{color:var(--muted)}.info dd{margin:0;font-weight:600}
@@ -909,7 +923,14 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 .room{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff;display:flex;flex-direction:column}
 .room .img{background:#111;aspect-ratio:4/3;position:relative}.room .img img{width:100%;height:100%;object-fit:cover;display:block}
 .room .img .noimg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:13px}
-.room .img .st{position:absolute;left:8px;top:8px}.room .body{padding:10px 12px;display:grid;gap:6px}.room .name{font-weight:600;font-size:17px;text-align:center}
+.room .img .st{position:absolute;left:8px;top:8px}
+/* 카드 본문: 왼쪽 텍스트(회의실명/상태) + 오른쪽 세로 버튼 3개 (회의실명 높이에서 시작) */
+.room .body{padding:10px 12px;display:grid;grid-template-columns:1fr auto;gap:6px 12px;align-items:start}
+.room .body .txt{display:grid;gap:6px;min-width:0}
+/* 버튼 3개: 높이 약 2/3 로 줄이고, 회의실명 위쪽 ~ 마지막 줄(주소·갱신) 아래쪽 사이에 고르게 배치 -> 예약하기 버튼 아래가 텍스트 마지막 줄과 맞음 */
+.room .body .btns{display:flex;flex-direction:column;justify-content:space-between;align-self:stretch;gap:4px;min-width:96px}
+.room .body .btns a{display:block}.room .body .btns button{width:100%;padding:2px 8px;font-size:12px;line-height:1.35}
+.room .name{font-weight:600;font-size:17px;text-align:center}
 .room{cursor:pointer}.room:hover{border-color:var(--acc);box-shadow:0 2px 8px rgba(37,99,235,.15)}
 .room.selected{outline:2px solid var(--acc)}
 .tl-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
@@ -939,10 +960,15 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 .datebox input[type=date]{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;padding:0;border:0}
 .datebox.sun #dateText{color:#dc2626}.datebox.sat #dateText{color:#2563eb}
 .form-grid{display:flex;gap:10px;margin-top:12px;align-items:flex-end;flex-wrap:wrap}
-.form-grid>div{flex:0 0 auto}.form-grid .grow{flex:1 1 140px;min-width:120px}.form-grid .grow2{flex:2 1 200px;min-width:160px}.form-grid .grow input{width:100%}
+.form-grid>div{flex:0 0 auto}.form-grid .grow{flex:1 1 90px;min-width:90px}.form-grid .grow2{flex:2 1 220px;min-width:180px}.form-grid .grow input{width:100%}
+.form-grid .name{flex:0.6 1 60px;min-width:70px}.form-grid .purpose{flex:1.4 1 150px}   /* 예약자명 60%, 줄어든 만큼 회의 목적 확대 */
 .form-grid .btn{margin-left:auto}
 @media (max-width:700px){.form-grid .btn{margin-left:0;flex:1 1 100%}}
 .msg{margin-top:8px;min-height:18px;font-size:13px}.msg.ok{color:var(--ok)}.msg.bad{color:var(--bad)}
+.lnk,.ib{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:5px;text-decoration:none;font-size:12px;line-height:1;vertical-align:middle;padding:0;border:none;cursor:pointer}
+.lnk.on{background:#dbeafe;color:var(--acc)}.lnk.on:hover{background:var(--acc);color:#fff}.lnk.off{color:#d1d5db;cursor:default;background:none}
+.ib.edit{background:#e5e7eb;color:var(--fg)}.ib.edit:hover{background:#cbd5e1}.ib.del{background:#fee2e2;color:var(--bad)}.ib.del:hover{background:var(--bad);color:#fff}
+.ib svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .legend{display:flex;gap:12px;font-size:12px;color:var(--muted);align-items:center}.legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:4px;vertical-align:-2px}
 </style></head><body>
 <header><h1>회의실 예약 시스템</h1><span class="muted" id="clock"></span><span class="sp"></span><a href="/admin">관리자</a></header>
@@ -955,7 +981,7 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
   <div class="fill"><div class="scroll"><div class="rooms" id="rooms"><div class="muted">인증된 카메라가 아직 없습니다. 기기에서 인증코드를 입력하면 여기에 표시됩니다.</div></div></div></div></div>
  <div class="card"><h2>회의실 정보 <span class="muted" id="infoName"></span></h2><div id="roomInfo" class="muted">회의실을 선택하세요</div></div>
  <div class="card"><h2>이 날의 예약 목록 <span class="muted" id="listNote"></span></h2>
-  <div class="fill"><div class="scroll"><table><thead><tr><th>시간</th><th>예약자</th><th>회의 목적</th><th></th></tr></thead><tbody id="resList"><tr><td colspan="4" class="muted">예약 없음</td></tr></tbody></table>
+  <div class="fill"><div class="scroll"><table><thead><tr><th>시간</th><th>예약자</th><th>회의 목적</th><th>링크</th><th></th></tr></thead><tbody id="resList"><tr><td colspan="5" class="muted">예약 없음</td></tr></tbody></table>
   <p class="muted" style="margin:10px 0 0">예약 막대를 더블클릭하거나 [수정]을 누르면 예약 정보를 고칠 수 있습니다</p></div></div></div>
 
 <div class="card resv"><h2>예약</h2>
@@ -974,8 +1000,9 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 <div class="form-grid">
  <div><label>시작</label><select id="start"></select></div>
  <div><label>종료</label><select id="end"></select></div>
- <div class="grow"><label>예약자명</label><input type="text" id="reserver" placeholder="홍길동"></div>
- <div class="grow grow2"><label>회의 목적</label><input type="text" id="purpose" placeholder="주간 회의"></div>
+ <div class="grow name"><label>예약자명</label><input type="text" id="reserver" placeholder="홍길동"></div>
+ <div class="grow purpose"><label>회의 목적</label><input type="text" id="purpose" placeholder="가급적 15자 이내로 입력요망"></div>
+ <div class="grow grow2"><label>줌/구글밋 링크 <span class="muted">(선택)</span></label><input type="text" id="link" placeholder="https://zoom.us/j/... 또는 https://meet.google.com/..."></div>
  <div class="btn"><button id="btnReserve" onclick="reserve()">예약하기</button></div>
 </div>
 <div class="msg" id="msg"></div>
@@ -1007,6 +1034,7 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
    <div><label>종료</label><select id="eEnd"></select></div>
    <div><label>예약자명</label><input type="text" id="eReserver"></div>
    <div><label>회의 목적</label><input type="text" id="ePurpose"></div>
+   <div class="full"><label>줌/구글밋 링크 <span class="muted">(선택)</span></label><input type="text" id="eLink" placeholder="https://..."></div>
   </div>
   <div class="msg" id="eMsg"></div>
   <div class="row" style="margin-top:12px;justify-content:flex-end"><button class="bad" onclick="deleteFromEdit()">예약 삭제</button><span class="sp" style="flex:1"></span><button class="sec" onclick="closeEdit()">취소</button><button onclick="confirmEdit()">수정 확인</button></div>
@@ -1137,10 +1165,10 @@ async function loadRooms(){
     let warn='';if(r.online&&r.detect===false)warn='<div style="color:#dc2626;font-size:12px">이 기기는 얼굴 감지(블러)가 꺼져 있습니다 - 보드 PSRAM 설정 확인'+(SERVER_BLUR?' (서버에서 대신 블러 처리 중)':' (서버 블러도 꺼짐: opencv 설치 필요)')+'</div>';
     warn = '';
     return '<div class="room'+(r.room===sel.value?' selected':'')+'" data-room="'+esc(r.room)+'" onclick="if(!event.target.closest(\'a,button\'))pickRoom(this.dataset.room)"><div class="img">'+(r.has_snapshot?'<img src="/snapshot/'+r.mac+'.jpg?t='+t+'">':'<div class="noimg">스냅샷 없음</div>')+'<div class="st">'+st+'</div></div>'
-     +'<div class="body"><div class="name">'+esc(r.room||'(회의실명 없음)')+'</div>'
+     +'<div class="body"><div class="txt"><div class="name">'+esc(r.room||'(회의실명 없음)')+'</div>'
      +'<div class="muted">'+(cr?'현재 예약: '+cr.start+'~'+cr.end+' '+esc(cr.reserver)+' · '+esc(cr.purpose):'현재 예약 없음')+(note?' &nbsp;|&nbsp; '+note:'')+'</div>'+warn
-     +'<div class="muted">'+esc(r.ip)+' · 갱신 '+(r.last_heartbeat_ago==null?'-':r.last_heartbeat_ago+'초 전')+(r.rssi?' · '+r.rssi+' dBm':'')+'</div>'
-     +'<div class="row"><a href="'+r.stream_url+'" target="_blank"><button class="sm sec" type="button">실시간 영상</button></a><a href="'+r.device_url+'" target="_blank"><button class="sm sec" type="button">기기 페이지</button></a><button class="sm" onclick="pickRoom(\''+esc(r.room)+'\')">예약하기</button></div></div></div>'}).join('');
+     +'<div class="muted">'+esc(r.ip)+' · 갱신 '+(r.last_heartbeat_ago==null?'-':r.last_heartbeat_ago+'초 전')+(r.rssi?' · '+r.rssi+' dBm':'')+'</div></div>'
+     +'<div class="btns"><a href="'+r.stream_url+'" target="_blank"><button class="sec" type="button">실시간 영상</button></a><a href="'+r.device_url+'" target="_blank"><button class="sec" type="button">기기 페이지</button></a><button onclick="pickRoom(\''+esc(r.room)+'\')">예약하기</button></div></div></div>'}).join('');
   $('roomsNote').textContent='· '+j.server_time;fitCols();
 }
 function fitCols(){}   // 왼쪽 카드 높이는 grid 가 오른쪽(정보/목록 + 예약) 블록 높이에 맞춰 늘림
@@ -1156,7 +1184,15 @@ async function loadReservations(){updateDow();
   if(!room){reservations=[];render();return}
   const j=await(await fetch('/api/reservations?room='+encodeURIComponent(room)+'&date='+d,{cache:'no-store'})).json();
   reservations=j.reservations;render();
+  if(selStart<0)applyDefaultTime();   // 사용자가 칸을 고르기 전이면 현재 시각 기준 기본 시간 선택
 }
+// 시작 시간 기본값: 오늘이면 현재 시각 이후의 다음 30분 경계 (16:35 -> 17:00), 종료는 +30분. 다른 날은 08:00
+function applyDefaultTime(){const now=new Date();let m=OPEN*60;
+  if($('date').value===ymd(now)){m=Math.ceil((now.getHours()*60+now.getMinutes()+1)/STEP)*STEP;m=Math.max(OPEN*60,Math.min(CLOSE*60-STEP,m))}
+  const i=(m-OPEN*60)/STEP;selStart=i;selEnd=i;
+  // 그 칸이 이미 예약돼 있으면 다음 빈 칸으로
+  while(selStart<NSLOTS-1&&isBusy(selStart)){selStart++;selEnd=selStart}
+  $('start').value=hhmm(slotMin(selStart));$('end').value=hhmm(slotMin(selEnd+1));paintSel()}
 function render(){
   if(typeof drag!=='undefined'&&drag)return;   // 드래그 중에는 다시 그리지 않음
   const now=new Date(),d=$('date').value,todayStr=ymd(now);
@@ -1166,20 +1202,20 @@ function render(){
   $('tlRes').innerHTML=reservations.map(r=>{const l=(toMin(r.start)-OPEN*60)/STEP,w=(toMin(r.end)-toMin(r.start))/STEP;
     const cur=isToday&&toMin(r.start)<=nowMin&&nowMin<toMin(r.end);
     const past=isPast||(isToday&&toMin(r.end)<=nowMin);   // 끝난 예약은 옅은 회색
-    return '<div class="res'+(cur?' now':'')+(past?' past':'')+'" data-id="'+r.id+'" style="left:calc('+pct(l)+' + 2px);width:calc('+pct(w)+' - 4px)" title="가운데: 이동 / 양끝: 시간 조절 · '+esc(r.purpose)+'"><b>'+esc(r.reserver)+'</b><span class="t">'+r.start+'~'+r.end+'</span><span>'+esc(r.purpose)+'</span><span class="x" title="예약 취소">✕</span><span class="h hl" title="시작 시간 조절"></span><span class="h hr" title="종료 시간 조절"></span></div>'}).join('');
+    return '<div class="res'+(cur?' now':'')+(past?' past':'')+'" data-id="'+r.id+'" style="left:calc('+pct(l)+' + 2px);width:calc('+pct(w)+' - 4px)" title="가운데: 이동 / 양끝: 시간 조절 · '+esc(r.purpose)+(r.link?' · 링크: '+esc(r.link):'')+'"><b>'+esc(r.reserver)+'</b><span class="t">'+r.start+'~'+r.end+'</span><span>'+esc(r.purpose)+'</span><span class="x" title="예약 취소">✕</span><span class="h hl" title="시작 시간 조절"></span><span class="h hr" title="종료 시간 조절"></span></div>'}).join('');
   const nowEl=$('tlNow');
   if(isToday&&nowMin>=OPEN*60&&nowMin<=CLOSE*60){nowEl.style.display='';nowEl.style.left=pct((nowMin-OPEN*60)/STEP)}else nowEl.style.display='none';
   paintSel();
   $('resList').innerHTML=reservations.length?reservations.map(r=>{const past=isPast||(isToday&&toMin(r.end)<=nowMin);const cur=isToday&&toMin(r.start)<=nowMin&&nowMin<toMin(r.end);
-    return '<tr'+(past?' class="past"':cur?' class="now"':'')+'><td style="white-space:nowrap">'+r.start+' ~ '+r.end+(cur?'<span class="badge ok">진행중</span>':'')+'</td><td>'+esc(r.reserver)+'</td><td>'+esc(r.purpose)+'</td><td style="white-space:nowrap"><button class="sm sec" onclick="openEdit(\''+r.id+'\')">수정</button> <button class="sm bad" onclick="delRes(\''+r.id+'\')">취소</button></td></tr>'}).join(''):'<tr><td colspan="4" class="muted">예약 없음</td></tr>';
+    return '<tr'+(past?' class="past"':cur?' class="now"':'')+'><td style="white-space:nowrap">'+r.start+' ~ '+r.end+(cur?'<span class="badge ok">진행중</span>':'')+'</td><td>'+esc(r.reserver)+'</td><td>'+esc(r.purpose)+'</td><td>'+linkIcon(r.link)+'</td><td>'+ICON_EDIT.replace('%ID%',r.id)+' '+ICON_DEL.replace('%ID%',r.id)+'</td></tr>'}).join(''):'<tr><td colspan="5" class="muted">예약 없음</td></tr>';
 }
 async function reserve(){
   const m=$('msg');m.className='msg';m.textContent='';
-  const body={room:$('room').value,date:$('date').value,start:$('start').value,end:$('end').value,reserver:$('reserver').value,purpose:$('purpose').value};
+  const body={room:$('room').value,date:$('date').value,start:$('start').value,end:$('end').value,reserver:$('reserver').value,purpose:$('purpose').value,link:$('link').value};
   if(!body.room){m.className='msg bad';m.textContent='회의실을 선택하세요';return}
   $('btnReserve').disabled=true;
   try{const r=await fetch('/api/reservations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();
-    if(j.ok){m.className='msg ok';m.textContent='예약되었습니다: '+body.start+'~'+body.end+' '+body.reserver;selStart=selEnd=-1;$('purpose').value='';loadReservations();loadRooms()}
+    if(j.ok){m.className='msg ok';m.textContent='예약되었습니다: '+body.start+'~'+body.end+' '+body.reserver;selStart=selEnd=-1;$('purpose').value='';$('link').value='';loadReservations();loadRooms()}
     else{m.className='msg bad';m.textContent=j.error||'예약 실패'}
   }catch(e){m.className='msg bad';m.textContent='요청 실패: '+e}
   $('btnReserve').disabled=false;
@@ -1227,11 +1263,11 @@ function renderInfo(){const name=$('room').value;$('infoName').textContent=name?
 
 // ---- 예약 수정 모달 (막대 더블클릭 / 목록의 [수정]) ----
 function openEdit(id){const r=reservations.find(x=>x.id===id);if(!r)return;editId=id;
-  $('eRoom').value=r.room;$('eDate').value=r.date;$('eStart').value=r.start;$('eEnd').value=r.end;$('eReserver').value=r.reserver;$('ePurpose').value=r.purpose;
+  $('eRoom').value=r.room;$('eDate').value=r.date;$('eStart').value=r.start;$('eEnd').value=r.end;$('eReserver').value=r.reserver;$('ePurpose').value=r.purpose;$('eLink').value=r.link||'';
   $('eMsg').className='msg';$('eMsg').textContent='';$('editModal').hidden=false;$('eReserver').focus()}
 function closeEdit(){$('editModal').hidden=true;editId=null}
 async function confirmEdit(){if(!editId)return;const m=$('eMsg');m.className='msg';m.textContent='';
-  const body={date:$('eDate').value,start:$('eStart').value,end:$('eEnd').value,reserver:$('eReserver').value.trim(),purpose:$('ePurpose').value.trim()};
+  const body={date:$('eDate').value,start:$('eStart').value,end:$('eEnd').value,reserver:$('eReserver').value.trim(),purpose:$('ePurpose').value.trim(),link:$('eLink').value.trim()};
   if(toMin(body.start)>=toMin(body.end)){m.className='msg bad';m.textContent='종료 시간은 시작 시간보다 늦어야 합니다';return}
   if(!body.reserver||!body.purpose){m.className='msg bad';m.textContent='예약자명과 회의 목적을 입력하세요';return}
   try{const r=await fetch('/api/reservations/'+editId,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();
@@ -1276,6 +1312,14 @@ async function saveConfig(){const m=$('cfgMsg');m.className='msg';m.textContent=
     if(!j.ok){m.className='msg bad';m.textContent=j.error||'저장 실패';return}
     m.className='msg ok';m.textContent='저장했습니다';await loadConfig();cfgEdit=null;renderSettings()}
   catch(e){m.className='msg bad';m.textContent='요청 실패: '+e}}
+// 목록의 작은 아이콘 버튼 (링크 / 수정 / 삭제 - 모두 같은 크기)
+const SVG_LINK='<svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>';
+const SVG_EDIT='<svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
+const SVG_DEL='<svg viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>';
+const ICON_EDIT='<button class="ib edit" title="수정" onclick="openEdit(\'%ID%\')">'+SVG_EDIT+'</button>';
+const ICON_DEL='<button class="ib del" title="예약 취소" onclick="delRes(\'%ID%\')">'+SVG_DEL+'</button>';
+// 링크 아이콘: 링크가 있으면 활성(클릭 시 새 탭으로 열림), 없으면 회색
+function linkIcon(url){if(!url)return '<span class="lnk off ib" title="링크 없음">'+SVG_LINK+'</span>';const u=esc(url);return '<a class="lnk on ib" href="'+u+'" target="_blank" rel="noopener" title="'+u+'" onclick="event.stopPropagation()">'+SVG_LINK+'</a>'}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function tick(){const n=new Date();$('clock').textContent=n.toLocaleString('ko-KR');const c=$('tabClock');if(!c)return;
   const dn=['일','월','화','수','목','금','토'][n.getDay()];const hh=String(n.getHours()).padStart(2,'0'),mm=String(n.getMinutes()).padStart(2,'0'),ss=String(n.getSeconds()).padStart(2,'0');
