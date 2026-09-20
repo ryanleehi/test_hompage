@@ -1031,12 +1031,15 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
  #resList tr.now{border-color:var(--ok)}
  #resList td{display:grid;grid-template-columns:64px 1fr;gap:8px;padding:3px 0;border:none;text-align:left;width:auto;white-space:normal!important;align-items:center}
  #resList td::before{content:attr(data-l);color:var(--muted);font-size:12px;font-weight:400}
+ #resList td .tv{white-space:nowrap}   /* 시간 + [진행중] 태그를 한 줄에 */
  #resList td:nth-child(4){text-align:left}
  #resList tr td[colspan]{display:block}#resList tr td[colspan]::before{content:none}}.cols3 .fill>.scroll{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;padding-right:4px}
 .cols3 .fill>.scroll::-webkit-scrollbar{width:8px}.cols3 .fill>.scroll::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:4px}
 @media (max-width:1000px){.cols3{grid-template-columns:1fr;grid-template-rows:none}.cols3>.cams,.cols3>.resv,.cols3>.info,.cols3>.list{grid-row:auto;grid-column:auto}
  .cols3>.cams{order:1}.cols3>.resv{order:2}.cols3>.info{order:3}.cols3>.list{order:4}   /* 폰: 회의실 현황 → 예약 → 회의실 정보 → 예약 목록 */.cols3 .fill{min-height:0}.cols3 .fill>.scroll{position:static;max-height:60vh}}
 .info{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px}.info dt{color:var(--muted)}.info dd{margin:0;font-weight:600}
+@media (max-width:1000px){ /* 폰: 회의실 정보를 2단(항목·값 × 2)으로 */
+ .info{grid-template-columns:5.6em 1fr 5.6em 1fr;gap:6px 8px}.info dt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.info dd{min-width:0}.info dt.w{grid-column:1}.info dd.w{grid-column:2/-1}}
 .yes{color:var(--ok)}.no{color:#9ca3af}
 /* 지난 예약: 옅은 회색 */
 .res.past{background:#d1d5db;color:#4b5563;box-shadow:none}.res.past .h::after{background:rgba(75,85,99,.5)}tr.past td{color:#9ca3af}
@@ -1083,6 +1086,7 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 .room .body .btns{display:flex;flex-direction:column;justify-content:space-between;align-self:stretch;gap:4px;width:72px;min-width:72px}   /* 버튼 폭 75% (96 -> 72px) */
 .room .body .btns a{display:block}.room .body .btns button{width:100%;padding:2px 4px;font-size:11px;line-height:1.35;letter-spacing:-0.2px}
 .room .name{font-weight:600;font-size:17px;text-align:center}
+@media (max-width:700px){.room .body .sep{display:none}.room .body .hb{display:block}}   /* 폰: 갱신/신호 정보는 IP 아래 줄에 */
 .room{cursor:pointer}.room:hover{border-color:var(--acc);box-shadow:0 2px 8px rgba(37,99,235,.15)}
 .room.selected{outline:2px solid var(--acc)}
 .tl-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
@@ -1347,7 +1351,7 @@ async function loadRooms(){
     return '<div class="room'+(r.room===sel.value?' selected':'')+'" data-room="'+esc(r.room)+'" onclick="if(!event.target.closest(\'a,button\'))pickRoom(this.dataset.room)"><div class="img">'+(r.has_snapshot?'<img src="/snapshot/'+r.mac+'.jpg?t='+t+'">':'<div class="noimg">스냅샷 없음</div>')+'<div class="st">'+st+'</div></div>'
      +'<div class="body"><div class="txt"><div class="name">'+esc(r.room||'(회의실명 없음)')+'</div>'
      +'<div class="muted">'+(cr?'현재 예약: '+cr.start+'~'+cr.end+' '+esc(cr.reserver)+' · '+esc(cr.purpose):'현재 예약 없음')+(note?' &nbsp;|&nbsp; '+note:'')+'</div>'+warn
-     +'<div class="muted">'+esc(r.ip)+' · 갱신 '+(r.last_heartbeat_ago==null?'-':r.last_heartbeat_ago+'초 전')+(r.rssi?' · '+r.rssi+' dBm':'')+'</div></div>'
+     +'<div class="muted"><span class="ip">'+esc(r.ip)+'</span><span class="sep"> · </span><span class="hb">갱신 '+(r.last_heartbeat_ago==null?'-':r.last_heartbeat_ago+'초 전')+(r.rssi?' · '+r.rssi+' dBm':'')+'</span></div></div>'
      +'<div class="btns"><a href="'+r.stream_url+'" target="_blank"><button class="sec" type="button">실시간 영상</button></a><a href="'+r.device_url+'" target="_blank"><button class="sec" type="button">기기 페이지</button></a><button onclick="pickRoom(\''+esc(r.room)+'\')">예약하기</button></div></div></div>'}).join('');
   $('roomsNote').textContent='· '+j.server_time;fitCols();
 }
@@ -1388,7 +1392,7 @@ function render(){
   if(isToday&&nowMin>=OPEN*60&&nowMin<=CLOSE*60){nowEl.style.display='';nowEl.style.left=pct((nowMin-OPEN*60)/STEP)}else nowEl.style.display='none';
   paintSel();
   $('resList').innerHTML=reservations.length?reservations.map(r=>{const past=isPast||(isToday&&toMin(r.end)<=nowMin);const cur=isToday&&toMin(r.start)<=nowMin&&nowMin<toMin(r.end);
-    return '<tr'+(past?' class="past"':cur?' class="now"':'')+'><td data-l="시간" style="white-space:nowrap">'+r.start+' ~ '+r.end+(cur?'<span class="badge ok">진행중</span>':'')+'</td><td data-l="예약자">'+esc(r.reserver)+'</td><td data-l="회의 목적">'+esc(r.purpose)+'</td><td data-l="링크">'+linkIcon(r.link)+'</td><td data-l="관리"><span class="acts">'+ICON_EDIT.replace('%ID%',r.id)+ICON_DEL.replace('%ID%',r.id)+'</span></td></tr>'}).join(''):'<tr><td colspan="5" class="muted">예약 없음</td></tr>';
+    return '<tr'+(past?' class="past"':cur?' class="now"':'')+'><td data-l="시간" style="white-space:nowrap"><span class="tv">'+r.start+' ~ '+r.end+(cur?'<span class="badge ok">진행중</span>':'')+'</span></td><td data-l="예약자">'+esc(r.reserver)+'</td><td data-l="회의 목적">'+esc(r.purpose)+'</td><td data-l="링크">'+linkIcon(r.link)+'</td><td data-l="관리"><span class="acts">'+ICON_EDIT.replace('%ID%',r.id)+ICON_DEL.replace('%ID%',r.id)+'</span></td></tr>'}).join(''):'<tr><td colspan="5" class="muted">예약 없음</td></tr>';
 }
 async function reserve(){
   const m=$('msg');m.className='msg';m.textContent='';
@@ -1431,8 +1435,8 @@ function renderInfo(){const name=$('room').value;$('infoName').textContent=name?
   if(!name){box.className='muted';box.textContent='회의실을 선택하세요';return}
   const i=config.rooms[name]||{};const cam=rooms.find(r=>r.room===name);
   const yn=v=>v?'<span class="yes">있음</span>':'<span class="no">없음</span>';
-  let st='<span class="no">카메라 없음</span>';
-  if(cam)st=!cam.online?'<span class="badge">오프라인</span>':cam.occupied?'<span class="badge ok">재실 ('+cam.faces+'명)</span>':'<span class="badge warn">비어있음</span>';
+  let st='<span class="badge">미사용</span>';
+  if(cam)st=!cam.online?'<span class="badge">오프라인</span>':cam.occupied?'<span class="badge ok">사용중</span>':'<span class="badge">미사용</span>';
   const cr=cam&&cam.current_reservation;
   box.className='';box.innerHTML='<dl class="info">'
    +'<dt>층</dt><dd>'+(i.floor?esc(i.floor):'<span class="no">미지정</span>')+'</dd>'
@@ -1441,11 +1445,11 @@ function renderInfo(){const name=$('room').value;$('infoName').textContent=name?
    +'<dt>테이블 수</dt><dd>'+(i.tables||0)+'개</dd>'
    +'<dt>화이트보드</dt><dd>'+yn(i.whiteboard)+'</dd>'
    +'<dt>화상회의 장비</dt><dd>'+yn(i.vc)+'</dd>'
-   +'<dt>비고</dt><dd>'+(i.note?esc(i.note):'<span class="no">-</span>')+'</dd>'
+   +(i.note?'<dt class="w">비고</dt><dd class="w">'+esc(i.note)+'</dd>':'')
    +'<dt>현재 상태</dt><dd>'+st+'</dd>'
-   +'<dt>현재 예약</dt><dd>'+(cr?cr.start+' ~ '+cr.end:'<span class="no">없음</span>')+'</dd>'
+   +'<dt>현재 예약</dt><dd style="white-space:nowrap">'+(cr?cr.start+'~'+cr.end:'<span class="no">없음</span>')+'</dd>'
    +'<dt>예약자</dt><dd>'+(cr?esc(cr.reserver):'<span class="no">-</span>')+'</dd>'
-   +'<dt>회의 목적</dt><dd>'+(cr?esc(cr.purpose):'<span class="no">-</span>')+'</dd>'
+   +'<dt class="w">회의 목적</dt><dd class="w">'+(cr?esc(cr.purpose):'<span class="no">-</span>')+'</dd>'
    +'</dl><p class="muted" style="margin:12px 0 0"><a href="#" onclick="cfgSub=\'settings\';setTab(\'settings\');return false">⚙ 설정에서 정보 수정</a></p>'}
 
 // ---- 예약 수정 모달 (막대 더블클릭 / 목록의 [수정]) ----
