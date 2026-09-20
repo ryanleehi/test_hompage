@@ -987,7 +987,7 @@ def index():
 BASE_CSS = """
 :root{--bg:#f3f5f7;--card:#fff;--fg:#1c2430;--muted:#66717f;--line:#dde2e8;--acc:#2563eb;--acc2:#dbeafe;--ok:#16a34a;--warn:#d97706;--bad:#dc2626}
 *{box-sizing:border-box}body{margin:0;font-family:-apple-system,"Apple SD Gothic Neo","Malgun Gothic",sans-serif;background:var(--bg);color:var(--fg);font-size:14px}
-header{background:#111827;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:16px}header h1{font-size:18px;margin:0;font-weight:600}
+header{background:#111827;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:16px;flex-wrap:nowrap;white-space:nowrap}header h1{font-size:18px;margin:0;font-weight:600;overflow:hidden;text-overflow:ellipsis}
 header a{color:#cbd5e1;text-decoration:none;font-size:13px}header .sp{flex:1}
 main{max-width:1200px;margin:0 auto;padding:18px;display:grid;gap:16px}
 /* grid 아이템은 기본 min-width:auto 라서 안쪽의 넓은 시간 막대가 카드를 화면보다 넓게 늘림 → 0 으로 고정 */
@@ -1016,15 +1016,26 @@ INDEX_HTML = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><met
 .tabclock .time{display:inline-block;width:5em;text-align:left;font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,Consolas,monospace}   /* 고정폭: 초가 바뀌어도 날짜 위치가 움직이지 않음 */
 /* 층 탭 화면: 왼쪽 카메라 | 가운데 회의실 정보 | 오른쪽 예약 목록 */
 .cols3{display:grid;grid-template-columns:minmax(270px,1fr) minmax(200px,.68fr) minmax(340px,1.32fr);grid-template-rows:auto 1fr;gap:16px}   /* 회의실 정보 열을 80% 로 줄이고 그만큼 예약 목록 열을 넓힘 */
+.cols3{grid-template-rows:1fr auto}
 .cols3>.cams{grid-row:1/3;grid-column:1}          /* 회의실 현황: 왼쪽 열 전체 높이 */
-.cols3>.resv{grid-column:2/4}                      /* 예약 섹션: 회의실 정보 + 예약 목록 아래, 그 두 카드 폭만큼 */
+.cols3>.resv{grid-row:1;grid-column:2/4}          /* 예약 섹션: 오른쪽 위, 회의실 정보 + 예약 목록 두 카드 폭만큼 */
+.cols3>.info{grid-row:2;grid-column:2}.cols3>.list{grid-row:2;grid-column:3}   /* 회의실 정보 / 예약 목록: 예약 섹션 아래 */
 .cols3>.card{min-width:0;display:flex;flex-direction:column}.cols3 .rooms{grid-template-columns:1fr;align-content:start}
 /* 왼쪽(회의실 현황)/오른쪽(예약 목록) 내용은 절대 배치 -> 행 높이에 영향을 주지 않고, 행 높이는 가운데 '회의실 정보' 카드의 내용 높이로 결정됨 */
 .cols3 .fill{flex:1 1 auto;position:relative;min-height:160px}
 tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical-align:1px}
-#resList td:nth-child(2){white-space:nowrap}#resList td:nth-child(4){text-align:center;width:30px}#resList td:nth-child(5){white-space:nowrap;width:56px}.cols3 .fill>.scroll{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;padding-right:4px}
+#resList td:nth-child(2){white-space:nowrap}#resList td:nth-child(4){text-align:center;width:30px}#resList td:nth-child(5){white-space:nowrap;width:56px}
+@media (max-width:700px){ /* 폰: 예약 하나를 '항목  값' 세로 목록 카드로 표시 */
+ .list table thead{display:none}
+ #resList tr{display:block;border:1px solid var(--line);border-radius:8px;padding:6px 10px;margin-bottom:8px;background:#fff}
+ #resList tr.now{border-color:var(--ok)}
+ #resList td{display:grid;grid-template-columns:64px 1fr;gap:8px;padding:3px 0;border:none;text-align:left;width:auto;white-space:normal!important;align-items:center}
+ #resList td::before{content:attr(data-l);color:var(--muted);font-size:12px;font-weight:400}
+ #resList td:nth-child(4){text-align:left}
+ #resList tr td[colspan]{display:block}#resList tr td[colspan]::before{content:none}}.cols3 .fill>.scroll{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;padding-right:4px}
 .cols3 .fill>.scroll::-webkit-scrollbar{width:8px}.cols3 .fill>.scroll::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:4px}
-@media (max-width:1000px){.cols3{grid-template-columns:1fr;grid-template-rows:none}.cols3>.cams{grid-row:auto;grid-column:auto}.cols3>.resv{grid-column:auto}.cols3 .fill{min-height:0}.cols3 .fill>.scroll{position:static;max-height:60vh}}
+@media (max-width:1000px){.cols3{grid-template-columns:1fr;grid-template-rows:none}.cols3>.cams,.cols3>.resv,.cols3>.info,.cols3>.list{grid-row:auto;grid-column:auto}
+ .cols3>.cams{order:1}.cols3>.resv{order:2}.cols3>.info{order:3}.cols3>.list{order:4}   /* 폰: 회의실 현황 → 예약 → 회의실 정보 → 예약 목록 */.cols3 .fill{min-height:0}.cols3 .fill>.scroll{position:static;max-height:60vh}}
 .info{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px}.info dt{color:var(--muted)}.info dd{margin:0;font-weight:600}
 .yes{color:var(--ok)}.no{color:#9ca3af}
 /* 지난 예약: 옅은 회색 */
@@ -1038,7 +1049,7 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 .chips{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 12px}.chip{background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:4px 10px;font-size:13px;display:flex;gap:6px;align-items:center}.chip b{cursor:pointer;color:var(--bad)}
 /* 대시보드 */
 .viz-root{--surface-1:#fcfcfb;--series-1:#2a78d6;--series-1-soft:#cde2fb;--grid:#e6e8eb;--text-secondary:#52514e}
-.subtabs{display:flex;gap:6px;margin-bottom:14px}.subtab{padding:6px 14px;border-radius:999px;background:#e9edf2;cursor:pointer;font-size:13px;font-weight:600;color:var(--muted)}.subtab.active{background:var(--acc);color:#fff}
+.subtabs{display:flex;gap:6px;margin-bottom:14px}.subtabs[hidden]{display:none}.subtab{padding:6px 14px;border-radius:999px;background:#e9edf2;cursor:pointer;font-size:13px;font-weight:600;color:var(--muted)}.subtab.active{background:var(--acc);color:#fff}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
 .tile{background:var(--surface-1);border:1px solid var(--line);border-radius:10px;padding:12px 14px}.tile .lbl{font-size:12px;color:var(--muted)}.tile .val{font-size:26px;font-weight:600;margin-top:4px;font-variant-numeric:tabular-nums}.tile .sub{font-size:12px;color:var(--muted);margin-top:2px}
 .tile.hero .val{font-size:40px}
@@ -1055,11 +1066,11 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 .room .img .noimg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:13px}
 .room .img .st{position:absolute;left:8px;top:8px}
 /* 카드 본문: 왼쪽 텍스트(회의실명/상태) + 오른쪽 세로 버튼 3개 (회의실명 높이에서 시작) */
-.room .body{padding:10px 12px;display:grid;grid-template-columns:1fr auto;gap:6px 12px;align-items:start}
+.room .body{padding:10px 12px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 10px;align-items:start}
 .room .body .txt{display:grid;gap:6px;min-width:0}
 /* 버튼 3개: 높이 약 2/3 로 줄이고, 회의실명 위쪽 ~ 마지막 줄(주소·갱신) 아래쪽 사이에 고르게 배치 -> 예약하기 버튼 아래가 텍스트 마지막 줄과 맞음 */
-.room .body .btns{display:flex;flex-direction:column;justify-content:space-between;align-self:stretch;gap:4px;min-width:96px}
-.room .body .btns a{display:block}.room .body .btns button{width:100%;padding:2px 8px;font-size:12px;line-height:1.35}
+.room .body .btns{display:flex;flex-direction:column;justify-content:space-between;align-self:stretch;gap:4px;width:72px;min-width:72px}   /* 버튼 폭 75% (96 -> 72px) */
+.room .body .btns a{display:block}.room .body .btns button{width:100%;padding:2px 4px;font-size:11px;line-height:1.35;letter-spacing:-0.2px}
 .room .name{font-weight:600;font-size:17px;text-align:center}
 .room{cursor:pointer}.room:hover{border-color:var(--acc);box-shadow:0 2px 8px rgba(37,99,235,.15)}
 .room.selected{outline:2px solid var(--acc)}
@@ -1089,6 +1100,10 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 .datebox{position:relative;display:inline-block;padding:8px 12px;border:1px solid var(--line);border-radius:6px;background:#fff;font-weight:600;min-width:140px;cursor:pointer}
 .datebox input[type=date]{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;padding:0;border:0}
 .datebox.sun #dateText{color:#dc2626}.datebox.sat #dateText{color:#2563eb}
+.datenav{display:flex;gap:6px;white-space:nowrap}.datenav button{height:37px}.datebox{height:37px;box-sizing:border-box;display:inline-flex;align-items:center}
+@media (max-width:700px){ /* 폰: 회의실/날짜 입력창 85% 폭, 날짜 오른쪽에 이전일·오늘·다음날 버튼 한 줄 */
+ .resv .row{gap:8px}.f-room{width:100%}.f-room select{width:85%;min-width:0!important}.f-date{width:100%}
+ .datebox{min-width:0;width:auto;padding:0 10px;font-size:14px}.datenav{gap:4px}.datenav button{padding:0 8px;font-size:12px;height:34px}.datebox{height:34px}}
 .form-grid{display:flex;gap:10px;margin-top:12px;align-items:flex-end;flex-wrap:wrap}
 .form-grid>div{flex:0 0 auto}.form-grid .grow{flex:1 1 90px;min-width:90px}.form-grid .grow2{flex:2 1 220px;min-width:180px}.form-grid .grow input{width:100%}
 .form-grid .name{flex:0.6 1 60px;min-width:70px}.form-grid .purpose{flex:1.4 1 150px}   /* 예약자명 60%, 줄어든 만큼 회의 목적 확대 */
@@ -1097,11 +1112,11 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 .msg{margin-top:8px;min-height:18px;font-size:13px}.msg.ok{color:var(--ok)}.msg.bad{color:var(--bad)}
 .lnk,.ib{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:5px;text-decoration:none;font-size:12px;line-height:1;vertical-align:middle;padding:0;border:none;cursor:pointer}
 .lnk.on{background:#dbeafe;color:var(--acc)}.lnk.on:hover{background:var(--acc);color:#fff}.lnk.off{color:#d1d5db;cursor:default;background:none}
-.ib.edit{background:#e5e7eb;color:var(--fg)}.ib.edit:hover{background:#cbd5e1}.ib.del{background:#fee2e2;color:var(--bad)}.ib.del:hover{background:var(--bad);color:#fff}
+.acts{display:inline-flex;gap:6px}.ib.edit{background:#e5e7eb;color:var(--fg)}.ib.edit:hover{background:#cbd5e1}.ib.del{background:#fee2e2;color:var(--bad)}.ib.del:hover{background:var(--bad);color:#fff}
 .ib svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .legend{display:flex;gap:12px;font-size:12px;color:var(--muted);align-items:center}.legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:4px;vertical-align:-2px}
 </style></head><body>
-<header><h1>회의실 예약 시스템</h1><span class="muted" id="clock"></span><span class="sp"></span><a href="/admin">관리자</a></header>
+<header><h1>회의실 예약 시스템</h1><span class="sp"></span><a href="/admin">관리자</a></header>
 <div class="tabs" id="tabs"></div>
 <main>
 <div id="viewRooms" style="display:grid;gap:16px;min-width:0">
@@ -1109,25 +1124,18 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
  <div class="card cams"><h2>회의실 현황 <span class="muted" id="roomsNote"></span></h2>
   <p class="muted" style="margin:-6px 0 10px{% if not detector_ok %};color:#dc2626{% endif %}">서버 검출: {{ detector }}{% if not detector_ok %} — 사람/얼굴 검출이 꺼져 있어 보드가 얼굴을 못 잡으면 "비어있음"으로 표시됩니다{% endif %}</p>
   <div class="fill"><div class="scroll"><div class="rooms" id="rooms"><div class="muted">인증된 카메라가 아직 없습니다. 기기에서 인증코드를 입력하면 여기에 표시됩니다.</div></div></div></div></div>
- <div class="card"><h2>회의실 정보 <span class="muted" id="infoName"></span></h2><div id="roomInfo" class="muted">회의실을 선택하세요</div></div>
- <div class="card"><h2>이 날의 예약 목록 <span class="muted" id="listNote"></span></h2>
+ <div class="card info"><h2>회의실 정보 <span class="muted" id="infoName"></span></h2><div id="roomInfo" class="muted">회의실을 선택하세요</div></div>
+ <div class="card list"><h2>이 날의 예약 목록 <span class="muted" id="listNote"></span></h2>
   <div class="fill"><div class="scroll"><table><thead><tr><th>시간</th><th>예약자</th><th>회의 목적</th><th>링크</th><th></th></tr></thead><tbody id="resList"><tr><td colspan="5" class="muted">예약 없음</td></tr></tbody></table>
   <p class="muted" style="margin:10px 0 0">예약 막대를 더블클릭하거나 [수정]을 누르면 예약 정보를 고칠 수 있습니다</p></div></div></div>
 
 <div class="card resv"><h2>예약</h2>
 <div class="row">
- <div><label>회의실</label><select id="room" style="min-width:180px"></select></div>
- <div><label>날짜</label><div class="datebox"><span id="dateText"></span><input type="date" id="date" value="{{ today }}" title="클릭해서 날짜 선택"></div></div>
- <div style="align-self:end"><button class="sec" onclick="shiftDate(-1)">◀ 이전일</button> <button class="sec" onclick="setToday()">오늘</button> <button class="sec" onclick="shiftDate(1)">다음날 ▶</button></div>
+ <div class="f-room"><label>회의실</label><select id="room" style="min-width:180px"></select></div>
+ <div class="f-date"><label>날짜</label><div class="row" style="gap:6px;flex-wrap:nowrap"><div class="datebox"><span id="dateText"></span><input type="date" id="date" value="{{ today }}" title="클릭해서 날짜 선택"></div>
+  <div class="datenav"><button class="sec" onclick="shiftDate(-1)">◀ 이전일</button><button class="sec" onclick="setToday()">오늘</button><button class="sec" onclick="shiftDate(1)">다음날 ▶</button></div></div></div>
 </div>
-<div class="tl-toolbar" style="margin-top:14px">
- <span class="muted">{{ '%02d' % open_hour }}:00 ~ {{ '%02d' % close_hour }}:00 · {{ slot_min }}분 단위 · 빈 칸을 클릭/드래그해서 시간 선택 · 예약 블록: 가운데 끌기=이동, 양끝 끌기=시간 조절, 더블클릭=수정, ✕=취소</span>
- <span class="sp" style="flex:1"></span>
- <span class="legend"><span><i style="background:#2563eb"></i>예약됨</span><span><i style="background:#16a34a"></i>진행 중</span><span><i style="background:#d1d5db"></i>지난 예약</span><span><i style="background:#dbeafe;border:1px solid #93c5fd"></i>선택</span></span>
-</div>
-<div class="tl-wrap" id="tlWrap"><div class="tl" id="tl"><div class="tl-hours" id="tlHours"></div><div class="tl-slots" id="tlSlots"></div><div id="tlRes"></div><div class="tl-now" id="tlNow" style="display:none"></div></div></div>
-
-<div class="form-grid">
+<div class="form-grid" style="margin-top:14px">
  <div><label>시작</label><select id="start"></select></div>
  <div><label>종료</label><select id="end"></select></div>
  <div class="grow name"><label>예약자명</label><input type="text" id="reserver" placeholder="홍길동"></div>
@@ -1136,10 +1144,18 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
  <div class="btn"><button id="btnReserve" onclick="reserve()">예약하기</button></div>
 </div>
 <div class="msg" id="msg"></div>
+<div class="tl-wrap" id="tlWrap" style="margin-top:12px"><div class="tl" id="tl"><div class="tl-hours" id="tlHours"></div><div class="tl-slots" id="tlSlots"></div><div id="tlRes"></div><div class="tl-now" id="tlNow" style="display:none"></div></div></div>
+<div class="tl-toolbar" style="margin-top:10px;margin-bottom:0">
+ <span class="muted">{{ '%02d' % open_hour }}:00 ~ {{ '%02d' % close_hour }}:00 · {{ slot_min }}분 단위 · 빈 칸을 클릭/드래그해서 시간 선택 · 예약 블록: 가운데 끌기=이동, 양끝 끌기=시간 조절, 더블클릭=수정, ✕=취소</span>
+ <span class="sp" style="flex:1"></span>
+ <span class="legend"><span><i style="background:#2563eb"></i>예약됨</span><span><i style="background:#16a34a"></i>진행 중</span><span><i style="background:#d1d5db"></i>지난 예약</span><span><i style="background:#dbeafe;border:1px solid #93c5fd"></i>선택</span></span>
+</div>
+
 </div>
 </div>
 </div>
 
+<div id="cfgSubtabs" class="subtabs" hidden style="margin:0 0 -4px"><span class="subtab active" data-sub="settings" onclick="setCfgSub('settings')">⚙ 설정</span><span class="subtab" data-sub="dash" onclick="setCfgSub('dash')">📊 대시보드</span></div>
 <div id="viewDash" class="card viz-root" hidden>
 <div class="row" style="justify-content:space-between;margin-bottom:10px"><h2 style="margin:0">📊 대시보드</h2>
  <div class="subtabs" style="margin:0"><span class="subtab active" data-sub="stats" onclick="setDashSub('stats')">통계</span><span class="subtab" data-sub="log" onclick="setDashSub('log')">로그</span></div></div>
@@ -1325,7 +1341,7 @@ async function loadRooms(){
   $('roomsNote').textContent='· '+j.server_time;fitCols();
 }
 function fitCols(){}   // 왼쪽 카드 높이는 grid 가 오른쪽(정보/목록 + 예약) 블록 높이에 맞춰 늘림
-window.addEventListener('resize',()=>{if(currentTab==='dash')loadStats()});
+window.addEventListener('resize',()=>{if(currentTab==='settings'&&cfgSub==='dash')loadStats()});
 function pickRoom(n){$('room').value=n;loadReservations();window.scrollTo({top:$('room').getBoundingClientRect().top+window.scrollY-80,behavior:'smooth'})}
 // 날짜를 "2026.09.20.일" 형식으로 표시 (input[type=date] 는 표시 형식을 바꿀 수 없어 텍스트로 대신 보여줌)
 function updateDow(){const v=$('date').value;const box=$('dateText').parentElement;if(!v){$('dateText').textContent='';return}
@@ -1361,7 +1377,7 @@ function render(){
   if(isToday&&nowMin>=OPEN*60&&nowMin<=CLOSE*60){nowEl.style.display='';nowEl.style.left=pct((nowMin-OPEN*60)/STEP)}else nowEl.style.display='none';
   paintSel();
   $('resList').innerHTML=reservations.length?reservations.map(r=>{const past=isPast||(isToday&&toMin(r.end)<=nowMin);const cur=isToday&&toMin(r.start)<=nowMin&&nowMin<toMin(r.end);
-    return '<tr'+(past?' class="past"':cur?' class="now"':'')+'><td style="white-space:nowrap">'+r.start+' ~ '+r.end+(cur?'<span class="badge ok">진행중</span>':'')+'</td><td>'+esc(r.reserver)+'</td><td>'+esc(r.purpose)+'</td><td>'+linkIcon(r.link)+'</td><td>'+ICON_EDIT.replace('%ID%',r.id)+' '+ICON_DEL.replace('%ID%',r.id)+'</td></tr>'}).join(''):'<tr><td colspan="5" class="muted">예약 없음</td></tr>';
+    return '<tr'+(past?' class="past"':cur?' class="now"':'')+'><td data-l="시간" style="white-space:nowrap">'+r.start+' ~ '+r.end+(cur?'<span class="badge ok">진행중</span>':'')+'</td><td data-l="예약자">'+esc(r.reserver)+'</td><td data-l="회의 목적">'+esc(r.purpose)+'</td><td data-l="링크">'+linkIcon(r.link)+'</td><td data-l="관리"><span class="acts">'+ICON_EDIT.replace('%ID%',r.id)+ICON_DEL.replace('%ID%',r.id)+'</span></td></tr>'}).join(''):'<tr><td colspan="5" class="muted">예약 없음</td></tr>';
 }
 async function reserve(){
   const m=$('msg');m.className='msg';m.textContent='';
@@ -1388,12 +1404,16 @@ async function loadConfig(){try{config=await(await fetch('/api/config',{cache:'n
   if(!startedAtFavorite){startedAtFavorite=true;const fav=config.favorite;
     if(fav&&config.rooms[fav]){const fl=config.rooms[fav].floor;currentTab=(fl&&config.floors.includes(fl))?fl:'all';$('room').innerHTML='';$('room').add(new Option(fav,fav));$('room').value=fav}}
   renderTabs()}
-function renderTabs(){const t=$('tabs');const tabs=[['all','전체'],...config.floors.map(f=>[f,f]),['dash','대시보드'],['settings','⚙ 설정']];
+function renderTabs(){const t=$('tabs');const tabs=[['all','전체'],...config.floors.map(f=>[f,f]),['settings','⚙ 설정']];
   if(!tabs.some(x=>x[0]===currentTab))currentTab='all';
-  t.innerHTML=tabs.map(([id,label])=>(id==='dash'?'<div class="tabclock" id="tabClock"></div>':'')+'<div class="tab'+(id===currentTab?' active':'')+(id==='settings'||id==='dash'?' cfg':'')+'" data-tab="'+esc(id)+'">'+esc(label)+'</div>').join('');tick();
+  t.innerHTML=tabs.map(([id,label])=>(id==='settings'?'<div class="tabclock" id="tabClock"></div>':'')+'<div class="tab'+(id===currentTab?' active':'')+(id==='settings'?' cfg':'')+'" data-tab="'+esc(id)+'">'+esc(label)+'</div>').join('');tick();
   t.querySelectorAll('.tab').forEach(el=>el.onclick=()=>setTab(el.dataset.tab))}
-function setTab(id){currentTab=id;renderTabs();const st=id==='settings',dash=id==='dash';$('viewSettings').hidden=!st;$('viewDash').hidden=!dash;$('viewRooms').style.display=(st||dash)?'none':'';
-  if(st)renderSettings();else if(dash){loadStats();loadLog()}else{$('room').value='';loadRooms()}}
+let cfgSub='settings';
+function setTab(id){currentTab=id;renderTabs();const st=id==='settings';$('cfgSubtabs').hidden=!st;$('viewRooms').style.display=st?'none':'';
+  if(st)setCfgSub(cfgSub);else{$('viewSettings').hidden=true;$('viewDash').hidden=true;$('room').value='';loadRooms()}}
+function setCfgSub(k){cfgSub=k;document.querySelectorAll('#cfgSubtabs .subtab').forEach(e=>e.classList.toggle('active',e.dataset.sub===k));
+  $('viewSettings').hidden=k!=='settings';$('viewDash').hidden=k!=='dash';
+  if(k==='settings')renderSettings();else{loadStats();loadLog()}}
 
 // ---- 가운데: 회의실 기본 정보 ----
 function renderInfo(){const name=$('room').value;$('infoName').textContent=name?'· '+name:'';const box=$('roomInfo');
@@ -1415,7 +1435,7 @@ function renderInfo(){const name=$('room').value;$('infoName').textContent=name?
    +'<dt>현재 예약</dt><dd>'+(cr?cr.start+' ~ '+cr.end:'<span class="no">없음</span>')+'</dd>'
    +'<dt>예약자</dt><dd>'+(cr?esc(cr.reserver):'<span class="no">-</span>')+'</dd>'
    +'<dt>회의 목적</dt><dd>'+(cr?esc(cr.purpose):'<span class="no">-</span>')+'</dd>'
-   +'</dl><p class="muted" style="margin:12px 0 0"><a href="#" onclick="setTab(\'settings\');return false">⚙ 설정에서 정보 수정</a></p>'}
+   +'</dl><p class="muted" style="margin:12px 0 0"><a href="#" onclick="cfgSub=\'settings\';setTab(\'settings\');return false">⚙ 설정에서 정보 수정</a></p>'}
 
 // ---- 예약 수정 모달 (막대 더블클릭 / 목록의 [수정]) ----
 function openEdit(id){const r=reservations.find(x=>x.id===id);if(!r)return;editId=id;
@@ -1493,7 +1513,7 @@ async function loadStats(){const p=$('statPeriod').value;let st;try{st=await(awa
   barChart($('chMonth'),st.by_month.map(x=>(+x.month.slice(5))+'월'),st.by_month.map(x=>x.count),'건',st.by_month.map(x=>x.month.replace('-','년 ')+'월'));
   hbarChart($('chRoom'),st.by_room.map(x=>x.room),st.by_room.map(x=>x.count),'건')}
 // 단일 계열 세로 막대 차트 (SVG): 막대 <=24px, 위쪽 4px 라운드, 하이라인 격자, 최대값만 직접 라벨, 마우스 오버 툴팁, 표 보기
-function barChart(box,labels,values,unit,fullLabels){   // fullLabels: 툴팁/표에 쓸 긴 이름 (선택)const W=Math.max(300,box.clientWidth||460),H=190,pl=34,pr=8,pt=14,pb=26;const n=labels.length;
+function barChart(box,labels,values,unit,fullLabels){   /* fullLabels: 툴팁/표에 쓸 긴 이름 (선택) */ const W=Math.max(300,box.clientWidth||460),H=190,pl=34,pr=8,pt=14,pb=26;const n=labels.length;
   if(!n){box.innerHTML='<div class="muted" style="padding:40px 0;text-align:center">데이터 없음</div>';return}
   const max=Math.max(1,...values);const step=niceStep(max);const top=Math.ceil(max/step)*step;
   const iw=W-pl-pr,ih=H-pt-pb,band=iw/n,bw=Math.min(24,band*0.6);const y=v=>pt+ih-(v/top)*ih;
@@ -1528,14 +1548,14 @@ function renderLog(){const f=$('logFilter').value;const rows=logRows.filter(r=>!
     return '<tr><td style="white-space:nowrap">'+esc(r.ts)+'</td><td><span class="act '+c+'">'+esc(r.action)+'</span></td><td>'+esc(r.room)+'</td><td style="white-space:nowrap">'+esc(r.date)+' '+esc(r.start)+'~'+esc(r.end)+'</td><td>'+esc(r.reserver)+'</td><td>'+esc(r.purpose)+'</td><td class="muted">'+esc(r.detail)+'</td><td class="muted">'+esc(r.ip)+'</td></tr>'}).join('')
    :'<tr><td colspan="8" class="muted">기록 없음</td></tr>'}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function tick(){const n=new Date();$('clock').textContent=n.toLocaleString('ko-KR');const c=$('tabClock');if(!c)return;
+function tick(){const n=new Date();const c=$('tabClock');if(!c)return;
   const dn=['일','월','화','수','목','금','토'][n.getDay()];const hh=String(n.getHours()).padStart(2,'0'),mm=String(n.getMinutes()).padStart(2,'0'),ss=String(n.getSeconds()).padStart(2,'0');
   const tEl=c.querySelector('.time');
   if(tEl&&c.dataset.d===ymd(n)){tEl.textContent=hh+':'+mm+':'+ss;return}   // 날짜가 같으면 시간 글자만 갱신
   c.dataset.d=ymd(n);
   c.innerHTML='<span class="date">'+ymd(n).replace(/-/g,'.')+'.<span class="dow'+(n.getDay()===0?' sun':'')+'">'+dn+'</span></span><span class="sep">|</span><span class="time">'+hh+':'+mm+':'+ss+'</span>'}
 setInterval(tick,1000);
-loadConfig().then(loadRooms);setInterval(()=>{if(currentTab!=='settings'&&currentTab!=='dash')loadRooms()},4000);setInterval(render,60000);
+loadConfig().then(loadRooms);setInterval(()=>{if(currentTab!=='settings')loadRooms()},4000);setInterval(render,60000);
 </script></body></html>"""
 
 
