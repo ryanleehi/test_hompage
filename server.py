@@ -1049,7 +1049,12 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 .chips{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 12px}.chip{background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:4px 10px;font-size:13px;display:flex;gap:6px;align-items:center}.chip b{cursor:pointer;color:var(--bad)}
 /* 대시보드 */
 .viz-root{--surface-1:#fcfcfb;--series-1:#2a78d6;--series-1-soft:#cde2fb;--grid:#e6e8eb;--text-secondary:#52514e}
-.subtabs{display:flex;gap:6px;margin-bottom:14px}.subtabs[hidden]{display:none}.subtab{padding:6px 14px;border-radius:999px;background:#e9edf2;cursor:pointer;font-size:13px;font-weight:600;color:var(--muted)}.subtab.active{background:var(--acc);color:#fff}
+.subtabs{display:flex;gap:6px;margin-bottom:14px}.subtabs[hidden]{display:none}
+/* 설정 탭 안의 [설정][대시보드]: 상단 탭과 같은 모양으로 카드 위에 붙임 (main 의 gap 16px 만큼 끌어내림) */
+.cfgtabs{gap:4px;margin:0 0 -17px;align-items:flex-end;justify-content:flex-end;padding-right:8px}   /* 카드 오른쪽 위에 붙임 */
+.cfgtabs .subtab{padding:9px 18px;border:1px solid var(--line);border-bottom:none;border-radius:9px 9px 0 0;background:#e9edf2;color:var(--muted);font-size:14px;font-weight:600;height:39px;box-sizing:border-box;line-height:20px}
+.cfgtabs .subtab:hover{background:#f3f5f8}.cfgtabs .subtab.active{background:var(--card);color:var(--fg);box-shadow:0 -2px 0 var(--acc) inset;position:relative;z-index:1}
+#viewSettings,#viewDash{border-top-right-radius:0}.subtab{padding:6px 14px;border-radius:999px;background:#e9edf2;cursor:pointer;font-size:13px;font-weight:600;color:var(--muted)}.subtab.active{background:var(--acc);color:#fff}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
 .tile{background:var(--surface-1);border:1px solid var(--line);border-radius:10px;padding:12px 14px}.tile .lbl{font-size:12px;color:var(--muted)}.tile .val{font-size:26px;font-weight:600;margin-top:4px;font-variant-numeric:tabular-nums}.tile .sub{font-size:12px;color:var(--muted);margin-top:2px}
 .tile.hero .val{font-size:40px}
@@ -1059,7 +1064,13 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 .chart .grid{stroke:var(--grid);stroke-width:1}.chart .axis{fill:var(--text-secondary);font-size:11px}.chart .vl{fill:var(--fg);font-size:11px;font-weight:600}
 .chart details{margin-top:6px}.chart summary{font-size:12px;color:var(--muted);cursor:pointer}.chart table td,.chart table th{padding:3px 6px;font-size:12px}
 .viz-tip{position:fixed;z-index:60;background:#111827;color:#fff;font-size:12px;padding:5px 9px;border-radius:6px;pointer-events:none;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.3)}
-.logtable td{font-size:13px;vertical-align:top}.logtable .act{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;color:#fff}.act.c{background:var(--acc)}.act.u{background:var(--warn)}.act.d{background:var(--bad)}
+.logtable td{font-size:13px;vertical-align:top}
+@media (max-width:700px){ /* 폰: 로그 한 건을 '항목  값' 카드로 표시 */
+ .logtable thead{display:none}
+ #logBody tr{display:block;border:1px solid var(--line);border-radius:8px;padding:6px 10px;margin-bottom:8px;background:#fff}
+ #logBody td{display:grid;grid-template-columns:64px 1fr;gap:8px;padding:3px 0;border:none;white-space:normal!important;align-items:center;word-break:break-all}
+ #logBody td::before{content:attr(data-l);color:var(--muted);font-size:12px}#logBody td .act{justify-self:start}
+ #logBody tr td[colspan]{display:block}#logBody tr td[colspan]::before{content:none}}.logtable .act{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;color:#fff}.act.c{background:var(--acc)}.act.u{background:var(--warn)}.act.d{background:var(--bad)}
 .cfgtable input[type=text]{width:100%}.cfgtable input[type=number]{width:70px;padding:6px 8px;border:1px solid var(--line);border-radius:6px}.cfgtable select{padding:6px 8px}
 .room{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff;display:flex;flex-direction:column}
 .room .img{background:#111;aspect-ratio:4/3;position:relative}.room .img img{width:100%;height:100%;object-fit:cover;display:block}
@@ -1155,7 +1166,7 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 </div>
 </div>
 
-<div id="cfgSubtabs" class="subtabs" hidden style="margin:0 0 -4px"><span class="subtab active" data-sub="settings" onclick="setCfgSub('settings')">⚙ 설정</span><span class="subtab" data-sub="dash" onclick="setCfgSub('dash')">📊 대시보드</span></div>
+<div id="cfgSubtabs" class="subtabs cfgtabs" hidden><span class="subtab active" data-sub="settings" onclick="setCfgSub('settings')">⚙ 설정</span><span class="subtab" data-sub="dash" onclick="setCfgSub('dash')">대시보드</span></div>
 <div id="viewDash" class="card viz-root" hidden>
 <div class="row" style="justify-content:space-between;margin-bottom:10px"><h2 style="margin:0">📊 대시보드</h2>
  <div class="subtabs" style="margin:0"><span class="subtab active" data-sub="stats" onclick="setDashSub('stats')">통계</span><span class="subtab" data-sub="log" onclick="setDashSub('log')">로그</span></div></div>
@@ -1545,7 +1556,7 @@ function hideVizTip(){const t=$('vizTip');if(t)t.style.display='none'}
 async function loadLog(){try{logRows=(await(await fetch('/api/log?limit=500',{cache:'no-store'})).json()).log}catch(e){logRows=[]}renderLog()}
 function renderLog(){const f=$('logFilter').value;const rows=logRows.filter(r=>!f||r.action===f);
   $('logBody').innerHTML=rows.length?rows.map(r=>{const c=r.action==='예약'?'c':r.action==='수정'?'u':'d';
-    return '<tr><td style="white-space:nowrap">'+esc(r.ts)+'</td><td><span class="act '+c+'">'+esc(r.action)+'</span></td><td>'+esc(r.room)+'</td><td style="white-space:nowrap">'+esc(r.date)+' '+esc(r.start)+'~'+esc(r.end)+'</td><td>'+esc(r.reserver)+'</td><td>'+esc(r.purpose)+'</td><td class="muted">'+esc(r.detail)+'</td><td class="muted">'+esc(r.ip)+'</td></tr>'}).join('')
+    return '<tr><td data-l="시각" style="white-space:nowrap">'+esc(r.ts)+'</td><td data-l="동작"><span class="act '+c+'">'+esc(r.action)+'</span></td><td data-l="회의실">'+esc(r.room)+'</td><td data-l="회의 시간" style="white-space:nowrap">'+esc(r.date)+' '+esc(r.start)+'~'+esc(r.end)+'</td><td data-l="예약자">'+esc(r.reserver)+'</td><td data-l="회의 목적">'+esc(r.purpose)+'</td><td data-l="상세" class="muted">'+esc(r.detail||'-')+'</td><td data-l="IP" class="muted">'+esc(r.ip)+'</td></tr>'}).join('')
    :'<tr><td colspan="8" class="muted">기록 없음</td></tr>'}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function tick(){const n=new Date();const c=$('tabClock');if(!c)return;
