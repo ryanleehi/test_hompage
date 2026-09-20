@@ -26,7 +26,7 @@ import secrets
 import threading
 import time
 import uuid
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 from flask import (Flask, Response, abort, jsonify, redirect, render_template_string,
                    request, url_for)
@@ -50,7 +50,7 @@ MAX_AUTH_FAILS = 5                            # 연속 실패 시 인증코드 �
 
 CLIENT_FIELDS = ["mac", "ip", "room", "auth_code", "authorized", "token",
                  "first_seen", "last_seen", "fail_count"]
-RES_FIELDS = ["id", "room", "date", "start", "end", "purpose", "reserver", "link", "created_at"]   # link: 줌/구글밋 등 회의 링크
+RES_FIELDS = ["id", "room", "date", "start", "end", "purpose", "reserver", "link", "series", "created_at"]   # link: 회의 링크, series: 매주 반복 묶음 ID
 
 
 def norm_link(v):
@@ -425,8 +425,9 @@ def load_reservations():
         return []
     with open(RESERVATIONS_CSV, newline="", encoding="utf-8") as f:
         rows = [dict(r) for r in csv.DictReader(f)]
-    for r in rows:                      # 예전 파일(link 컬럼 없음) 호환
+    for r in rows:                      # 예전 파일(link/series 컬럼 없음) 호환
         r["link"] = r.get("link") or ""
+        r["series"] = r.get("series") or ""
     return rows
 
 
@@ -775,18 +776,54 @@ def api_reservations_create():
     if not purpose:
         return jsonify(ok=False, error="회의 목적을 입력하세요"), 400
 
+    # 반복: repeat="weekly" 이면 date 부터 repeat_until 까지 매주 같은 요일·시간에 예약 인스턴스 생성
+    repeat = (d.get("repeat") or "once").strip()
+    skip_conflicts = bool(d.get("skip_conflicts"))
+    dates = [day]
+    if repeat == "weekly":
+        until = (d.get("repeat_until") or "").strip()
+        if not valid_date(until) or until < day:
+            return jsonify(ok=False, error="반복 종료일이 올바르지 않습니다"), 400
+        first = datetime.strptime(day, "%Y-%m-%d").date()
+        last = datetime.strptime(until, "%Y-%m-%d").date()
+        dates = []
+        cur = first
+        while cur <= last and len(dates) < 104:      # 최대 2년
+            dates.append(cur.isoformat())
+            cur += timedelta(days=7)
+
     with lock:
         rows = load_reservations()
-        for r in rows:
-            if r["room"] == room and r["date"] == day and to_min(start) < to_min(r["end"]) and to_min(r["start"]) < to_min(end):
-                return jsonify(ok=False, error="이미 예약된 시간과 겹칩니다 (%s~%s %s)" % (r["start"], r["end"], r["reserver"])), 409
-        new = {"id": uuid.uuid4().hex[:10], "room": room, "date": day, "start": start, "end": end,
-               "purpose": purpose, "reserver": reserver, "link": link, "created_at": now_str()}
-        rows.append(new)
+        conflicts = []
+        for dd in dates:
+            for r in rows:
+                if r["room"] == room and r["date"] == dd and to_min(start) < to_min(r["end"]) and to_min(r["start"]) < to_min(end):
+                    conflicts.append({"date": dd, "start": r["start"], "end": r["end"], "reserver": r["reserver"]})
+                    break
+        if conflicts and (len(dates) == 1 or not skip_conflicts):
+            c = conflicts[0]
+            msg = ("이미 예약된 시간과 겹칩니다 (%s~%s %s)" % (c["start"], c["end"], c["reserver"]) if len(dates) == 1
+                   else "%d개 주가 기존 예약과 겹칩니다" % len(conflicts))
+            return jsonify(ok=False, error=msg, conflicts=conflicts, total=len(dates)), 409
+        skip = {c["date"] for c in conflicts}
+        series = uuid.uuid4().hex[:8] if len(dates) > 1 else ""
+        created = []
+        for dd in dates:
+            if dd in skip:
+                continue
+            new = {"id": uuid.uuid4().hex[:10], "room": room, "date": dd, "start": start, "end": end,
+                   "purpose": purpose, "reserver": reserver, "link": link, "series": series, "created_at": now_str()}
+            rows.append(new)
+            created.append(new)
+        if not created:
+            return jsonify(ok=False, error="예약 가능한 날짜가 없습니다", conflicts=conflicts), 409
         save_reservations(rows)
-        log_activity("예약", new)
-    print("[RESERVE] %s %s %s~%s %s (%s)" % (room, day, start, end, reserver, purpose), flush=True)
-    return jsonify(ok=True, reservation=new)
+        if series:
+            log_activity("예약", created[0], "매주 반복 %d회 (~%s)%s" % (len(created), dates[-1], ", 겹침 %d회 건너뜀" % len(skip) if skip else ""))
+        else:
+            log_activity("예약", created[0])
+    print("[RESERVE] %s %s %s~%s %s (%s) x%d" % (room, day, start, end, reserver, purpose, len(created)), flush=True)
+    return jsonify(ok=True, reservation=created[0], created=len(created), skipped=sorted(skip), series=series)
 
 
 @app.route("/api/reservations/<rid>", methods=["PATCH", "PUT"])
@@ -824,7 +861,7 @@ def api_reservations_update(rid):
             changes.append("목적 %s → %s" % (cur["purpose"], purpose))
         if cur.get("link", "") != link:
             changes.append("링크 " + ("추가" if not cur.get("link") else ("삭제" if not link else "변경")))
-        cur.update(date=day, start=start, end=end, purpose=purpose, reserver=reserver, link=link)
+        cur.update(date=day, start=start, end=end, purpose=purpose, reserver=reserver, link=link)   # 반복 예약도 이 회차만 수정
         save_reservations(rows)
         log_activity("수정", cur, ", ".join(changes) or "변경 없음")
     print("[MOVE] %s %s -> %s %s~%s (%s)" % (cur["room"], old, day, start, end, reserver), flush=True)
@@ -833,15 +870,22 @@ def api_reservations_update(rid):
 
 @app.delete("/api/reservations/<rid>")
 def api_reservations_delete(rid):
+    scope = request.args.get("scope", "one")     # one: 이 회차만 / following: 이 회차부터 이후 반복 전체 / all: 시리즈 전체
     with lock:
         rows = load_reservations()
-        keep = [r for r in rows if r["id"] != rid]
-        if len(keep) == len(rows):
+        gone = next((r for r in rows if r["id"] == rid), None)
+        if not gone:
             return jsonify(ok=False, error="예약을 찾을 수 없습니다"), 404
-        gone = next(r for r in rows if r["id"] == rid)
+        if gone.get("series") and scope in ("following", "all"):
+            victims = [r for r in rows if r["series"] == gone["series"] and (scope == "all" or r["date"] >= gone["date"])]
+        else:
+            victims = [gone]
+        ids = {r["id"] for r in victims}
+        keep = [r for r in rows if r["id"] not in ids]
         save_reservations(keep)
-        log_activity("삭제", gone)
-    return jsonify(ok=True)
+        log_activity("삭제", gone, "반복 예약 %d회 삭제 (%s)" % (len(victims), "이후 전체" if scope == "following" else "시리즈 전체") if len(victims) > 1 else "")
+        n = len(victims)
+    return jsonify(ok=True, deleted=n)
 
 
 # ---------------------------------------------------------------------------
@@ -1037,9 +1081,10 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 .cols3 .fill>.scroll::-webkit-scrollbar{width:8px}.cols3 .fill>.scroll::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:4px}
 @media (max-width:1000px){.cols3{grid-template-columns:1fr;grid-template-rows:none}.cols3>.cams,.cols3>.resv,.cols3>.info,.cols3>.list{grid-row:auto;grid-column:auto}
  .cols3>.cams{order:1}.cols3>.resv{order:2}.cols3>.info{order:3}.cols3>.list{order:4}   /* 폰: 회의실 현황 → 예약 → 회의실 정보 → 예약 목록 */.cols3 .fill{min-height:0}.cols3 .fill>.scroll{position:static;max-height:60vh}}
-.info{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px}.info dt{color:var(--muted)}.info dd{margin:0;font-weight:600}
+.info{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px}.info dt{color:var(--muted)}.info dd{margin:0;font-weight:600}.info dd.tm{white-space:nowrap}
 @media (max-width:1000px){ /* 폰: 회의실 정보를 2단(항목·값 × 2)으로 */
- .info{grid-template-columns:5.6em 1fr 5.6em 1fr;gap:6px 8px}.info dt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.info dd{min-width:0}.info dt.w{grid-column:1}.info dd.w{grid-column:2/-1}}
+ .info{grid-template-columns:5.2em minmax(0,1fr) 5.2em minmax(0,1fr);gap:6px 6px}.info dt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px}.info dd{min-width:0;overflow-wrap:anywhere}.info dt.w{grid-column:1}.info dd.w{grid-column:2/-1}
+ .info dd.tm{font-size:12.5px;font-variant-numeric:tabular-nums;letter-spacing:-0.4px;white-space:nowrap}}   /* 현재 예약 시각: 카드 폭을 넘지 않게 축소 */
 .yes{color:var(--ok)}.no{color:#9ca3af}
 /* 지난 예약: 옅은 회색 */
 .res.past{background:#d1d5db;color:#4b5563;box-shadow:none}.res.past .h::after{background:rgba(75,85,99,.5)}tr.past td{color:#9ca3af}
@@ -1119,12 +1164,22 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 @media (max-width:700px){ /* 폰: 회의실/날짜 입력창 85% 폭, 날짜 오른쪽에 이전일·오늘·다음날 버튼 한 줄 */
  .resv .row{gap:8px}.f-room{width:100%}.f-room select{width:85%;min-width:0!important}.f-date{width:100%}
  .datebox{min-width:0;width:auto;padding:0 10px;font-size:14px}.datenav{gap:4px}.datenav button{padding:0 8px;font-size:12px;height:34px}.datebox{height:34px}}
-.form-grid{display:flex;gap:10px;margin-top:12px;align-items:flex-end;flex-wrap:wrap}
+/* 예약 카드 본문: 데스크톱은 [회의실·날짜·이전일/오늘/다음날 | 반복 라디오] 한 줄, 그 아래 입력 폼 → 메시지 → 시간 막대 → 안내 */
+.rbody{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:flex-end}
+.r-top{flex:0 0 auto;gap:8px}.r-top .datenav button{padding:0 10px}.r-rep{flex:1 1 0;min-width:190px;gap:10px;font-size:13px;min-height:37px;flex-wrap:nowrap;white-space:nowrap}
+.r-form,.r-msg,.r-tl,.r-help{flex-basis:100%}
+.r-msg{margin:0;min-height:0}.r-msg:empty{display:none}   /* 메시지가 없으면 예약하기 버튼 아래 공백 없음 */
+.m-btn{display:none}
+@media (max-width:700px){ /* 폰: 반복 라디오 + 예약하기 버튼을 한 줄에, 폼의 예약하기 버튼은 숨김 */
+ .r-top{flex-basis:100%}.r-form{order:2}.r-rep{order:3;flex-basis:100%;justify-content:flex-start}.r-msg{order:4}.r-tl{order:5}.r-help{order:6}
+ .r-rep .m-btn{display:inline-block;margin-left:auto}.r-form .btn{display:none}.r-rep .repopts{flex-basis:100%}}
+.form-grid{display:flex;gap:10px;margin-top:0;align-items:flex-end;flex-wrap:wrap}
 .form-grid>div{flex:0 0 auto}.form-grid .grow{flex:1 1 90px;min-width:90px}.form-grid .grow2{flex:2 1 220px;min-width:180px}.form-grid .grow input{width:100%}
 .form-grid .name{flex:0.6 1 60px;min-width:70px}.form-grid .purpose{flex:1.4 1 150px}   /* 예약자명 60%, 줄어든 만큼 회의 목적 확대 */
 .form-grid .btn{margin-left:auto}
 @media (max-width:700px){.form-grid .btn{margin-left:0;flex:1 1 100%}}
 .msg{margin-top:8px;min-height:18px;font-size:13px}.msg.ok{color:var(--ok)}.msg.bad{color:var(--bad)}
+.repopts{display:flex;align-items:center;gap:6px}.repopts[hidden]{display:none}
 .lnk,.ib{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:5px;text-decoration:none;font-size:12px;line-height:1;vertical-align:middle;padding:0;border:none;cursor:pointer}
 .lnk.on{background:#dbeafe;color:var(--acc)}.lnk.on:hover{background:var(--acc);color:#fff}.lnk.off{color:#d1d5db;cursor:default;background:none}
 .acts{display:inline-flex;gap:6px}.ib.edit{background:#e5e7eb;color:var(--fg)}.ib.edit:hover{background:#cbd5e1}.ib.del{background:#fee2e2;color:var(--bad)}.ib.del:hover{background:var(--bad);color:#fff}
@@ -1145,12 +1200,20 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
   <p class="muted" style="margin:10px 0 0">예약 막대를 더블클릭하거나 [수정]을 누르면 예약 정보를 고칠 수 있습니다</p></div></div></div>
 
 <div class="card resv"><h2>예약</h2>
-<div class="row">
- <div class="f-room"><label>회의실</label><select id="room" style="min-width:180px"></select></div>
+<div class="rbody">
+<div class="row r-top">
+ <div class="f-room"><label>회의실</label><select id="room" style="min-width:150px"></select></div>
  <div class="f-date"><label>날짜</label><div class="row" style="gap:6px;flex-wrap:nowrap"><div class="datebox"><span id="dateText"></span><input type="date" id="date" value="{{ today }}" title="클릭해서 날짜 선택"></div>
   <div class="datenav"><button class="sec" onclick="shiftDate(-1)">◀ 이전일</button><button class="sec" onclick="setToday()">오늘</button><button class="sec" onclick="shiftDate(1)">다음날 ▶</button></div></div></div>
 </div>
-<div class="form-grid" style="margin-top:14px">
+<div class="row r-rep">
+ <span class="muted">반복</span>
+ <label style="margin:0;font-size:13px;color:var(--fg);display:flex;align-items:center;gap:4px;cursor:pointer"><input type="radio" name="rep" value="once" checked onchange="onRepeat()"> 이번만</label>
+ <label style="margin:0;font-size:13px;color:var(--fg);display:flex;align-items:center;gap:4px;cursor:pointer"><input type="radio" name="rep" value="weekly" onchange="onRepeat()"> 매주 반복</label>
+ <span id="repOpts" class="repopts" hidden><span class="muted">기간</span><select id="repMonths" style="padding:4px 8px"><option value="1">1개월</option><option value="3" selected>3개월</option><option value="6">6개월</option><option value="12">1년</option></select><span class="muted" id="repHint"></span></span>
+ <button class="m-btn" onclick="reserve()">예약하기</button>
+</div>
+<div class="form-grid r-form">
  <div><label>시작</label><select id="start"></select></div>
  <div><label>종료</label><select id="end"></select></div>
  <div class="grow name"><label>예약자명</label><input type="text" id="reserver" placeholder="홍길동"></div>
@@ -1158,14 +1221,14 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
  <div class="grow grow2"><label>줌/구글밋 링크 <span class="muted">(선택)</span></label><input type="text" id="link" placeholder="https://zoom.us/j/... 또는 https://meet.google.com/..."></div>
  <div class="btn"><button id="btnReserve" onclick="reserve()">예약하기</button></div>
 </div>
-<div class="msg" id="msg"></div>
-<div class="tl-wrap" id="tlWrap" style="margin-top:12px"><div class="tl" id="tl"><div class="tl-hours" id="tlHours"></div><div class="tl-slots" id="tlSlots"></div><div id="tlRes"></div><div class="tl-now" id="tlNow" style="display:none"></div></div></div>
-<div class="tl-toolbar" style="margin-top:10px;margin-bottom:0">
+<div class="msg r-msg" id="msg"></div>
+<div class="tl-wrap r-tl" id="tlWrap"><div class="tl" id="tl"><div class="tl-hours" id="tlHours"></div><div class="tl-slots" id="tlSlots"></div><div id="tlRes"></div><div class="tl-now" id="tlNow" style="display:none"></div></div></div>
+<div class="tl-toolbar r-help" style="margin:0">
  <span class="muted">{{ '%02d' % open_hour }}:00 ~ {{ '%02d' % close_hour }}:00 · {{ slot_min }}분 단위 · 빈 칸을 클릭/드래그해서 시간 선택 · 예약 블록: 가운데 끌기=이동, 양끝 끌기=시간 조절, 더블클릭=수정, ✕=취소</span>
  <span class="sp" style="flex:1"></span>
  <span class="legend"><span><i style="background:#2563eb"></i>예약됨</span><span><i style="background:#16a34a"></i>진행 중</span><span><i style="background:#d1d5db"></i>지난 예약</span><span><i style="background:#dbeafe;border:1px solid #93c5fd"></i>선택</span></span>
 </div>
-
+</div>
 </div>
 </div>
 </div>
@@ -1210,7 +1273,7 @@ tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical
 
 <div id="editModal" class="modal" hidden>
  <div class="modal-box">
-  <h2>예약 수정</h2>
+  <h2>예약 수정 <span class="muted" id="eSeriesNote" style="font-size:12px;font-weight:400"></span></h2>
   <div class="grid">
    <div><label>회의실</label><input type="text" id="eRoom" disabled></div>
    <div><label>날짜</label><input type="date" id="eDate"></div>
@@ -1359,7 +1422,7 @@ function fitCols(){}   // 왼쪽 카드 높이는 grid 가 오른쪽(정보/목�
 window.addEventListener('resize',()=>{if(currentTab==='settings'&&cfgSub==='dash')loadStats()});
 function pickRoom(n){$('room').value=n;loadReservations();window.scrollTo({top:$('room').getBoundingClientRect().top+window.scrollY-80,behavior:'smooth'})}
 // 날짜를 "2026.09.20.일" 형식으로 표시 (input[type=date] 는 표시 형식을 바꿀 수 없어 텍스트로 대신 보여줌)
-function updateDow(){const v=$('date').value;const box=$('dateText').parentElement;if(!v){$('dateText').textContent='';return}
+function updateDow(){const v=$('date').value;const box=$('dateText').parentElement;if(!v){$('dateText').textContent='';return}if(typeof onRepeat==='function')setTimeout(onRepeat,0);
   const p=v.split('-');const d=new Date(+p[0],+p[1]-1,+p[2]);const n=['일','월','화','수','목','금','토'][d.getDay()];
   $('dateText').textContent=p[0]+'.'+p[1]+'.'+p[2]+'.'+n;box.className='datebox'+(d.getDay()===0?' sun':d.getDay()===6?' sat':'')}
 async function loadReservations(){updateDow();
@@ -1387,7 +1450,7 @@ function render(){
   $('tlRes').innerHTML=reservations.map(r=>{const l=(toMin(r.start)-OPEN*60)/STEP,w=(toMin(r.end)-toMin(r.start))/STEP;
     const cur=isToday&&toMin(r.start)<=nowMin&&nowMin<toMin(r.end);
     const past=isPast||(isToday&&toMin(r.end)<=nowMin);   // 끝난 예약은 옅은 회색
-    return '<div class="res'+(cur?' now':'')+(past?' past':'')+'" data-id="'+r.id+'" style="left:calc('+pct(l)+' + 2px);width:calc('+pct(w)+' - 4px)" title="가운데: 이동 / 양끝: 시간 조절 · '+esc(r.purpose)+(r.link?' · 링크: '+esc(r.link):'')+'"><b>'+esc(r.reserver)+'</b><span class="t">'+r.start+'~'+r.end+'</span><span>'+esc(r.purpose)+'</span><span class="x" title="예약 취소">✕</span><span class="h hl" title="시작 시간 조절"></span><span class="h hr" title="종료 시간 조절"></span></div>'}).join('');
+    return '<div class="res'+(cur?' now':'')+(past?' past':'')+'" data-id="'+r.id+'" style="left:calc('+pct(l)+' + 2px);width:calc('+pct(w)+' - 4px)" title="가운데: 이동 / 양끝: 시간 조절 · '+esc(r.purpose)+(r.link?' · 링크: '+esc(r.link):'')+'"><b>'+esc(r.reserver)+(r.series?' <span title="매주 반복">↻</span>':'')+'</b><span class="t">'+r.start+'~'+r.end+'</span><span>'+esc(r.purpose)+'</span><span class="x" title="예약 취소">✕</span><span class="h hl" title="시작 시간 조절"></span><span class="h hr" title="종료 시간 조절"></span></div>'}).join('');
   const nowEl=$('tlNow');
   if(isToday&&nowMin>=OPEN*60&&nowMin<=CLOSE*60){nowEl.style.display='';nowEl.style.left=pct((nowMin-OPEN*60)/STEP)}else nowEl.style.display='none';
   paintSel();
@@ -1398,14 +1461,32 @@ async function reserve(){
   const m=$('msg');m.className='msg';m.textContent='';
   const body={room:$('room').value,date:$('date').value,start:$('start').value,end:$('end').value,reserver:$('reserver').value,purpose:$('purpose').value,link:$('link').value};
   if(!body.room){m.className='msg bad';m.textContent='회의실을 선택하세요';return}
+  const weekly=document.querySelector('input[name=rep]:checked').value==='weekly';
+  if(weekly){body.repeat='weekly';body.repeat_until=repeatUntil()}
   $('btnReserve').disabled=true;
-  try{const r=await fetch('/api/reservations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();
-    if(j.ok){m.className='msg ok';m.textContent='예약되었습니다: '+body.start+'~'+body.end+' '+body.reserver;selStart=selEnd=-1;$('purpose').value='';$('link').value='';loadReservations();loadRooms()}
+  try{let r=await fetch('/api/reservations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let j=await r.json();
+    if(!j.ok&&r.status===409&&weekly&&j.conflicts&&j.conflicts.length<j.total){   // 일부 주만 겹침 -> 건너뛰고 나머지 예약할지 확인
+      const list=j.conflicts.slice(0,6).map(c=>'  '+c.date+' '+c.start+'~'+c.end+' '+c.reserver).join('\n')+(j.conflicts.length>6?'\n  … 외 '+(j.conflicts.length-6)+'건':'');
+      if(confirm('총 '+j.total+'주 중 '+j.conflicts.length+'주가 기존 예약과 겹칩니다.\n\n'+list+'\n\n겹치는 주는 건너뛰고 나머지 '+(j.total-j.conflicts.length)+'주를 예약할까요?')){
+        body.skip_conflicts=true;r=await fetch('/api/reservations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});j=await r.json()}}
+    if(j.ok){m.className='msg ok';m.textContent=(j.created>1?'매주 반복 예약 '+j.created+'회 완료'+(j.skipped&&j.skipped.length?' (겹친 '+j.skipped.length+'주 건너뜀)':''):'예약되었습니다')+': '+dowName($('date').value)+'요일 '+body.start+'~'+body.end+' '+body.reserver;
+      selStart=selEnd=-1;$('purpose').value='';$('link').value='';document.querySelector('input[name=rep][value=once]').checked=true;onRepeat();loadReservations();loadRooms()}
     else{m.className='msg bad';m.textContent=j.error||'예약 실패'}
   }catch(e){m.className='msg bad';m.textContent='요청 실패: '+e}
   $('btnReserve').disabled=false;
 }
-async function delRes(id){const r=await fetch('/api/reservations/'+id,{method:'DELETE'});const j=await r.json();if(!j.ok)alert(j.error||'취소 실패');loadReservations();loadRooms()}
+async function delRes(id){const res=reservations.find(x=>x.id===id);let scope='one';
+  if(res&&res.series){   // 매주 반복 예약: 범위 선택
+    const a=prompt('매주 반복 예약입니다. 어떻게 취소할까요?\n  1 = 이 회차만\n  2 = 이 회차부터 이후 전체\n  3 = 반복 전체','1');
+    if(a===null)return;scope={'1':'one','2':'following','3':'all'}[a.trim()];if(!scope){alert('1, 2, 3 중 하나를 입력하세요');return}}
+  const r=await fetch('/api/reservations/'+id+'?scope='+scope,{method:'DELETE'});const j=await r.json();if(!j.ok)alert(j.error||'취소 실패');
+  else if(j.deleted>1){const m=$('msg');m.className='msg';m.textContent='반복 예약 '+j.deleted+'회를 취소했습니다'}
+  loadReservations();loadRooms()}
+const dowName=v=>['일','월','화','수','목','금','토'][new Date(v+'T00:00:00').getDay()];
+function repeatUntil(){const p=$('date').value.split('-');const d=new Date(+p[0],+p[1]-1,+p[2]);d.setMonth(d.getMonth()+ +$('repMonths').value);return ymd(d)}
+function onRepeat(){const w=document.querySelector('input[name=rep]:checked').value==='weekly';$('repOpts').hidden=!w;
+  if(w){const u=repeatUntil();const p=$('date').value.split('-');const d0=new Date(+p[0],+p[1]-1,+p[2]);const n=Math.floor((new Date(u+'T00:00:00')-d0)/604800000)+1;$('repHint').textContent='매주 '+dowName($('date').value)+'요일 · '+u.replace(/-/g,'.')+' 까지 총 '+n+'회'}}
+$('repMonths').onchange=onRepeat;
 // toISOString() 은 UTC 기준이라 한국(UTC+9)에서는 날짜가 하루 어긋남 -> 로컬 날짜로 직접 포맷
 function ymd(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')}
 function shiftDate(n){const p=($('date').value||ymd(new Date())).split('-');const d=new Date(+p[0],+p[1]-1,+p[2]);d.setDate(d.getDate()+n);$('date').value=ymd(d);selStart=selEnd=-1;loadReservations()}
@@ -1447,7 +1528,7 @@ function renderInfo(){const name=$('room').value;$('infoName').textContent=name?
    +'<dt>화상회의 장비</dt><dd>'+yn(i.vc)+'</dd>'
    +(i.note?'<dt class="w">비고</dt><dd class="w">'+esc(i.note)+'</dd>':'')
    +'<dt>현재 상태</dt><dd>'+st+'</dd>'
-   +'<dt>현재 예약</dt><dd style="white-space:nowrap">'+(cr?cr.start+'~'+cr.end:'<span class="no">없음</span>')+'</dd>'
+   +'<dt>현재 예약</dt><dd class="tm">'+(cr?cr.start+'~'+cr.end:'<span class="no">없음</span>')+'</dd>'
    +'<dt>예약자</dt><dd>'+(cr?esc(cr.reserver):'<span class="no">-</span>')+'</dd>'
    +'<dt class="w">회의 목적</dt><dd class="w">'+(cr?esc(cr.purpose):'<span class="no">-</span>')+'</dd>'
    +'</dl><p class="muted" style="margin:12px 0 0"><a href="#" onclick="cfgSub=\'settings\';setTab(\'settings\');return false">⚙ 설정에서 정보 수정</a></p>'}
@@ -1455,6 +1536,7 @@ function renderInfo(){const name=$('room').value;$('infoName').textContent=name?
 // ---- 예약 수정 모달 (막대 더블클릭 / 목록의 [수정]) ----
 function openEdit(id){const r=reservations.find(x=>x.id===id);if(!r)return;editId=id;
   $('eRoom').value=r.room;$('eDate').value=r.date;$('eStart').value=r.start;$('eEnd').value=r.end;$('eReserver').value=r.reserver;$('ePurpose').value=r.purpose;$('eLink').value=r.link||'';
+  $('eSeriesNote').textContent=r.series?'(매주 반복 예약 - 이 회차만 수정됩니다)':'';
   $('eMsg').className='msg';$('eMsg').textContent='';$('editModal').hidden=false;$('eReserver').focus()}
 function closeEdit(){$('editModal').hidden=true;editId=null}
 async function confirmEdit(){if(!editId)return;const m=$('eMsg');m.className='msg';m.textContent='';
@@ -1560,7 +1642,7 @@ function hideVizTip(){const t=$('vizTip');if(t)t.style.display='none'}
 async function loadLog(){try{logRows=(await(await fetch('/api/log?limit=500',{cache:'no-store'})).json()).log}catch(e){logRows=[]}renderLog()}
 function renderLog(){const f=$('logFilter').value;const rows=logRows.filter(r=>!f||r.action===f);
   $('logBody').innerHTML=rows.length?rows.map(r=>{const c=r.action==='예약'?'c':r.action==='수정'?'u':'d';
-    return '<tr><td data-l="시각" style="white-space:nowrap">'+esc(r.ts)+'</td><td data-l="동작"><span class="act '+c+'">'+esc(r.action)+'</span></td><td data-l="회의실">'+esc(r.room)+'</td><td data-l="회의 시간" style="white-space:nowrap">'+esc(r.date)+' '+esc(r.start)+'~'+esc(r.end)+'</td><td data-l="예약자">'+esc(r.reserver)+'</td><td data-l="회의 목적">'+esc(r.purpose)+'</td><td data-l="상세" class="muted">'+esc(r.detail||'-')+'</td><td data-l="IP" class="muted">'+esc(r.ip)+'</td></tr>'}).join('')
+    return '<tr><td data-l="시각" style="white-space:nowrap">'+esc(r.ts)+'</td><td data-l="동작"><span class="act '+c+'">'+esc(r.action)+'</span></td><td data-l="회의실">'+esc(r.room)+'</td><td data-l="회의 시간" style="white-space:nowrap">'+esc(r.date)+' '+esc(r.start)+'~'+esc(r.end)+'</td><td data-l="예약자">'+esc(r.reserver)+(r.series?' <span class="muted" title="매주 반복">↻</span>':'')+'</td><td data-l="회의 목적">'+esc(r.purpose)+'</td><td data-l="상세" class="muted">'+esc(r.detail||'-')+'</td><td data-l="IP" class="muted">'+esc(r.ip)+'</td></tr>'}).join('')
    :'<tr><td colspan="8" class="muted">기록 없음</td></tr>'}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function tick(){const n=new Date();const c=$('tabClock');if(!c)return;
