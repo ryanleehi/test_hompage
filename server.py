@@ -20,6 +20,7 @@ ESP32-S3-CAM 클라이언트(esp32-s3-cam-meetingroom.ino)와 연동되는 Flask
 """
 
 import csv
+import json
 import os
 import secrets
 import threading
@@ -34,6 +35,7 @@ from flask import (Flask, Response, abort, jsonify, redirect, render_template_st
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CLIENTS_CSV = os.path.join(BASE_DIR, "clients.csv")
 RESERVATIONS_CSV = os.path.join(BASE_DIR, "reservations.csv")
+ROOMS_JSON = os.path.join(BASE_DIR, "rooms.json")            # 층 목록 + 회의실 기본 정보(층/TV/의자/테이블/화이트보드)
 SNAPSHOT_DIR = os.path.join(BASE_DIR, "snapshots")
 
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -583,6 +585,7 @@ def api_snapshot():
 def api_rooms():
     with lock:
         rows = load_reservations()
+        rcfg = load_rooms_config()
         out = []
         for mac in clients:
             v = client_view(mac)
@@ -590,17 +593,97 @@ def api_rooms():
                 continue
             cur = current_reservation(v["room"], rows) if v["room"] else None
             v["current_reservation"] = cur
+            v["info"] = dict(DEFAULT_ROOM_INFO, **rcfg["rooms"].get(v["room"], {}))
             out.append(v)
     out.sort(key=lambda x: (x["room"] or "~", x["mac"]))
     return jsonify(rooms=out, server_time=now_str())
 
 
+def all_room_names(cfg=None):
+    """카메라 기기 / 예약 내역 / 설정에 등장하는 모든 회의실명"""
+    names = {c.get("room") for c in clients.values() if c.get("authorized") == "1" and c.get("room")}
+    names |= {r["room"] for r in load_reservations()}
+    names |= set((cfg or load_rooms_config())["rooms"].keys())
+    names.discard("")
+    return sorted(names)
+
+
 @app.get("/api/room-names")
 def api_room_names():
     with lock:
-        names = {c.get("room") for c in clients.values() if c.get("authorized") == "1" and c.get("room")}
-        names |= {r["room"] for r in load_reservations()}
-    return jsonify(rooms=sorted(names))
+        return jsonify(rooms=all_room_names())
+
+
+# ---------------------------------------------------------------------------
+# 층 / 회의실 기본 정보 설정 (rooms.json)
+# ---------------------------------------------------------------------------
+DEFAULT_ROOM_INFO = {"floor": "", "tv": False, "chairs": 0, "tables": 0, "whiteboard": False, "vc": False, "note": ""}   # vc: 화상회의 장비
+
+
+def load_rooms_config():
+    cfg = {"floors": [], "rooms": {}, "favorite": ""}   # favorite: 자주 이용하는 회의실 (접속 시 그 층 탭으로 이동)
+    if os.path.exists(ROOMS_JSON):
+        try:
+            with open(ROOMS_JSON, encoding="utf-8") as f:
+                data = json.load(f)
+            cfg["floors"] = [str(x) for x in data.get("floors", []) if str(x).strip()]
+            cfg["favorite"] = str(data.get("favorite") or "").strip()
+            for name, info in (data.get("rooms") or {}).items():
+                merged = dict(DEFAULT_ROOM_INFO)
+                merged.update({k: info.get(k, v) for k, v in DEFAULT_ROOM_INFO.items()})
+                cfg["rooms"][name] = merged
+        except (OSError, ValueError) as e:
+            print("rooms.json 읽기 실패: %s" % e, flush=True)
+    return cfg
+
+
+def save_rooms_config(cfg):
+    tmp = ROOMS_JSON + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, ROOMS_JSON)
+
+
+@app.get("/api/config")
+def api_config_get():
+    with lock:
+        cfg = load_rooms_config()
+        names = all_room_names(cfg)
+        rooms = {n: dict(DEFAULT_ROOM_INFO, **cfg["rooms"].get(n, {})) for n in names}
+    return jsonify(floors=cfg["floors"], rooms=rooms, favorite=cfg.get("favorite", ""))
+
+
+@app.post("/api/config")
+def api_config_set():
+    d = request.get_json(silent=True) or {}
+    floors, seen = [], set()
+    for f in d.get("floors") or []:
+        f = str(f).strip()
+        if f and f not in seen:
+            floors.append(f)
+            seen.add(f)
+    rooms = {}
+    for name, info in (d.get("rooms") or {}).items():
+        name = str(name).strip()
+        if not name:
+            continue
+        info = info or {}
+        try:
+            chairs = max(0, int(info.get("chairs") or 0))
+            tables = max(0, int(info.get("tables") or 0))
+        except (TypeError, ValueError):
+            return jsonify(ok=False, error="의자/테이블 수는 숫자여야 합니다 (%s)" % name), 400
+        floor = str(info.get("floor") or "").strip()
+        if floor and floor not in seen:
+            return jsonify(ok=False, error="'%s' 의 층 '%s' 이(가) 층 목록에 없습니다" % (name, floor)), 400
+        rooms[name] = {"floor": floor, "tv": bool(info.get("tv")), "chairs": chairs, "tables": tables,
+                       "whiteboard": bool(info.get("whiteboard")), "vc": bool(info.get("vc")),
+                       "note": str(info.get("note") or "").strip()}
+    favorite = str(d.get("favorite") or "").strip()
+    with lock:
+        save_rooms_config({"floors": floors, "rooms": rooms, "favorite": favorite})
+    print("[CONFIG] 층 %s, 회의실 %d개 저장" % (floors, len(rooms)), flush=True)
+    return jsonify(ok=True)
 
 
 @app.get("/snapshot/<mac>.jpg")
@@ -776,7 +859,7 @@ BASE_CSS = """
 *{box-sizing:border-box}body{margin:0;font-family:-apple-system,"Apple SD Gothic Neo","Malgun Gothic",sans-serif;background:var(--bg);color:var(--fg);font-size:14px}
 header{background:#111827;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:16px}header h1{font-size:18px;margin:0;font-weight:600}
 header a{color:#cbd5e1;text-decoration:none;font-size:13px}header .sp{flex:1}
-main{max-width:1000px;margin:0 auto;padding:18px;display:grid;gap:16px}
+main{max-width:1200px;margin:0 auto;padding:18px;display:grid;gap:16px}
 /* grid 아이템은 기본 min-width:auto 라서 안쪽의 넓은 시간 막대가 카드를 화면보다 넓게 늘림 → 0 으로 고정 */
 main>*{min-width:0}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;max-width:100%}.card h2{font-size:16px;margin:0 0 12px}
@@ -792,7 +875,37 @@ INDEX_HTML = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><met
 <title>회의실 예약 시스템</title>
 <style>
 """ + BASE_CSS + r"""
-.rooms{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+.rooms{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+/* 탭 */
+.tabs{display:flex;gap:4px;max-width:1200px;margin:14px auto -16px;padding:0 18px;flex-wrap:wrap;align-items:flex-end}
+.tab{padding:9px 18px;border:1px solid var(--line);border-bottom:none;border-radius:9px 9px 0 0;background:#e9edf2;color:var(--muted);cursor:pointer;font-weight:600;font-size:14px}
+.tab:hover{background:#f3f5f8}.tab.active{background:#fff;color:var(--fg);box-shadow:0 -2px 0 var(--acc) inset}.tab.cfg{margin-left:6px}
+.tabclock{margin-left:auto;align-self:center;font-size:15px;font-weight:600;color:var(--fg);padding:0 10px 6px;white-space:nowrap;display:flex;align-items:center}
+.tabclock .dow{color:var(--acc)}.tabclock .sun{color:var(--bad)}
+.tabclock .sep{color:#c7ccd3;font-weight:400;margin:0 10px}
+.tabclock .time{display:inline-block;width:5em;text-align:left;font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,Consolas,monospace}   /* 고정폭: 초가 바뀌어도 날짜 위치가 움직이지 않음 */
+/* 층 탭 화면: 왼쪽 카메라 | 가운데 회의실 정보 | 오른쪽 예약 목록 */
+.cols3{display:grid;grid-template-columns:minmax(270px,1fr) minmax(240px,.85fr) minmax(300px,1.15fr);grid-template-rows:auto 1fr;gap:16px}
+.cols3>.cams{grid-row:1/3;grid-column:1}          /* 회의실 현황: 왼쪽 열 전체 높이 */
+.cols3>.resv{grid-column:2/4}                      /* 예약 섹션: 회의실 정보 + 예약 목록 아래, 그 두 카드 폭만큼 */
+.cols3>.card{min-width:0;display:flex;flex-direction:column}.cols3 .rooms{grid-template-columns:1fr;align-content:start}
+/* 왼쪽(회의실 현황)/오른쪽(예약 목록) 내용은 절대 배치 -> 행 높이에 영향을 주지 않고, 행 높이는 가운데 '회의실 정보' 카드의 내용 높이로 결정됨 */
+.cols3 .fill{flex:1 1 auto;position:relative;min-height:160px}
+tr.now td{color:var(--ok);font-weight:600}tr.now .badge{margin-left:6px;vertical-align:1px}.cols3 .fill>.scroll{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;padding-right:4px}
+.cols3 .fill>.scroll::-webkit-scrollbar{width:8px}.cols3 .fill>.scroll::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:4px}
+@media (max-width:1000px){.cols3{grid-template-columns:1fr;grid-template-rows:none}.cols3>.cams{grid-row:auto;grid-column:auto}.cols3>.resv{grid-column:auto}.cols3 .fill{min-height:0}.cols3 .fill>.scroll{position:static;max-height:60vh}}
+.info{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px}.info dt{color:var(--muted)}.info dd{margin:0;font-weight:600}
+.yes{color:var(--ok)}.no{color:#9ca3af}
+/* 지난 예약: 옅은 회색 */
+.res.past{background:#d1d5db;color:#4b5563;box-shadow:none}.res.past .h::after{background:rgba(75,85,99,.5)}tr.past td{color:#9ca3af}
+/* 예약 수정 모달 */
+.modal{position:fixed;inset:0;background:rgba(17,24,39,.45);display:flex;align-items:center;justify-content:center;z-index:50;padding:16px}.modal[hidden]{display:none}
+.modal-box{background:#fff;border-radius:12px;padding:20px 22px;width:100%;max-width:520px;box-shadow:0 10px 40px rgba(0,0,0,.3)}
+.modal-box h2{margin:0 0 14px;font-size:17px}.modal-box .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.modal-box .grid .full{grid-column:1/-1}
+.modal-box input[type=text],.modal-box input[type=date],.modal-box select{width:100%}
+/* 설정 */
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 12px}.chip{background:#eef2ff;border:1px solid #c7d2fe;border-radius:999px;padding:4px 10px;font-size:13px;display:flex;gap:6px;align-items:center}.chip b{cursor:pointer;color:var(--bad)}
+.cfgtable input[type=text]{width:100%}.cfgtable input[type=number]{width:70px;padding:6px 8px;border:1px solid var(--line);border-radius:6px}.cfgtable select{padding:6px 8px}
 .room{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff;display:flex;flex-direction:column}
 .room .img{background:#111;aspect-ratio:4/3;position:relative}.room .img img{width:100%;height:100%;object-fit:cover;display:block}
 .room .img .noimg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:13px}
@@ -822,40 +935,83 @@ INDEX_HTML = r"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><met
 .res b{display:block;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.res span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;opacity:.9}
 .res.now{background:#16a34a}
 .tl-now{position:absolute;top:26px;bottom:6px;width:2px;background:var(--bad);z-index:3;pointer-events:none}.tl-now::before{content:"지금";position:absolute;top:-16px;left:-12px;font-size:10px;color:var(--bad)}
-.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-top:12px}
+.datebox{position:relative;display:inline-block;padding:8px 12px;border:1px solid var(--line);border-radius:6px;background:#fff;font-weight:600;min-width:140px;cursor:pointer}
+.datebox input[type=date]{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;padding:0;border:0}
+.datebox.sun #dateText{color:#dc2626}.datebox.sat #dateText{color:#2563eb}
+.form-grid{display:flex;gap:10px;margin-top:12px;align-items:flex-end;flex-wrap:wrap}
+.form-grid>div{flex:0 0 auto}.form-grid .grow{flex:1 1 140px;min-width:120px}.form-grid .grow2{flex:2 1 200px;min-width:160px}.form-grid .grow input{width:100%}
+.form-grid .btn{margin-left:auto}
+@media (max-width:700px){.form-grid .btn{margin-left:0;flex:1 1 100%}}
 .msg{margin-top:8px;min-height:18px;font-size:13px}.msg.ok{color:var(--ok)}.msg.bad{color:var(--bad)}
 .legend{display:flex;gap:12px;font-size:12px;color:var(--muted);align-items:center}.legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:4px;vertical-align:-2px}
 </style></head><body>
 <header><h1>회의실 예약 시스템</h1><span class="muted" id="clock"></span><span class="sp"></span><a href="/admin">관리자</a></header>
+<div class="tabs" id="tabs"></div>
 <main>
-<div class="card"><h2>회의실 현황 <span class="muted" id="roomsNote"></span></h2>
-<p class="muted" style="margin:-6px 0 10px{% if not detector_ok %};color:#dc2626{% endif %}">서버 검출: {{ detector }}{% if not detector_ok %} — 사람/얼굴 검출이 꺼져 있어 보드가 얼굴을 못 잡으면 "비어있음"으로 표시됩니다{% endif %}</p><div class="rooms" id="rooms"><div class="muted">인증된 카메라가 아직 없습니다. 기기에서 인증코드를 입력하면 여기에 표시됩니다.</div></div></div>
+<div id="viewRooms" style="display:grid;gap:16px;min-width:0">
+<div class="cols3">
+ <div class="card cams"><h2>회의실 현황 <span class="muted" id="roomsNote"></span></h2>
+  <p class="muted" style="margin:-6px 0 10px{% if not detector_ok %};color:#dc2626{% endif %}">서버 검출: {{ detector }}{% if not detector_ok %} — 사람/얼굴 검출이 꺼져 있어 보드가 얼굴을 못 잡으면 "비어있음"으로 표시됩니다{% endif %}</p>
+  <div class="fill"><div class="scroll"><div class="rooms" id="rooms"><div class="muted">인증된 카메라가 아직 없습니다. 기기에서 인증코드를 입력하면 여기에 표시됩니다.</div></div></div></div></div>
+ <div class="card"><h2>회의실 정보 <span class="muted" id="infoName"></span></h2><div id="roomInfo" class="muted">회의실을 선택하세요</div></div>
+ <div class="card"><h2>이 날의 예약 목록 <span class="muted" id="listNote"></span></h2>
+  <div class="fill"><div class="scroll"><table><thead><tr><th>시간</th><th>예약자</th><th>회의 목적</th><th></th></tr></thead><tbody id="resList"><tr><td colspan="4" class="muted">예약 없음</td></tr></tbody></table>
+  <p class="muted" style="margin:10px 0 0">예약 막대를 더블클릭하거나 [수정]을 누르면 예약 정보를 고칠 수 있습니다</p></div></div></div>
 
-<div class="card"><h2>예약</h2>
+<div class="card resv"><h2>예약</h2>
 <div class="row">
  <div><label>회의실</label><select id="room" style="min-width:180px"></select></div>
- <div><label>날짜</label><input type="date" id="date" value="{{ today }}"></div>
+ <div><label>날짜</label><div class="datebox"><span id="dateText"></span><input type="date" id="date" value="{{ today }}" title="클릭해서 날짜 선택"></div></div>
  <div style="align-self:end"><button class="sec" onclick="shiftDate(-1)">◀ 이전일</button> <button class="sec" onclick="setToday()">오늘</button> <button class="sec" onclick="shiftDate(1)">다음날 ▶</button></div>
 </div>
 <div class="tl-toolbar" style="margin-top:14px">
- <span class="muted">{{ '%02d' % open_hour }}:00 ~ {{ '%02d' % close_hour }}:00 · {{ slot_min }}분 단위 · 빈 칸을 클릭/드래그해서 시간 선택 · 예약 블록 가운데를 끌면 이동, 양쪽 끝을 끌면 시간 늘리기/줄이기 · ✕ 로 취소</span>
+ <span class="muted">{{ '%02d' % open_hour }}:00 ~ {{ '%02d' % close_hour }}:00 · {{ slot_min }}분 단위 · 빈 칸을 클릭/드래그해서 시간 선택 · 예약 블록: 가운데 끌기=이동, 양끝 끌기=시간 조절, 더블클릭=수정, ✕=취소</span>
  <span class="sp" style="flex:1"></span>
- <span class="legend"><span><i style="background:#2563eb"></i>예약됨</span><span><i style="background:#16a34a"></i>진행 중</span><span><i style="background:#dbeafe;border:1px solid #93c5fd"></i>선택</span></span>
+ <span class="legend"><span><i style="background:#2563eb"></i>예약됨</span><span><i style="background:#16a34a"></i>진행 중</span><span><i style="background:#d1d5db"></i>지난 예약</span><span><i style="background:#dbeafe;border:1px solid #93c5fd"></i>선택</span></span>
 </div>
 <div class="tl-wrap" id="tlWrap"><div class="tl" id="tl"><div class="tl-hours" id="tlHours"></div><div class="tl-slots" id="tlSlots"></div><div id="tlRes"></div><div class="tl-now" id="tlNow" style="display:none"></div></div></div>
 
 <div class="form-grid">
  <div><label>시작</label><select id="start"></select></div>
  <div><label>종료</label><select id="end"></select></div>
- <div><label>예약자명</label><input type="text" id="reserver" placeholder="홍길동" style="width:100%"></div>
- <div style="grid-column:span 2"><label>회의 목적</label><input type="text" id="purpose" placeholder="주간 회의" style="width:100%"></div>
- <div style="align-self:end"><button id="btnReserve" onclick="reserve()" style="width:100%">예약하기</button></div>
+ <div class="grow"><label>예약자명</label><input type="text" id="reserver" placeholder="홍길동"></div>
+ <div class="grow grow2"><label>회의 목적</label><input type="text" id="purpose" placeholder="주간 회의"></div>
+ <div class="btn"><button id="btnReserve" onclick="reserve()">예약하기</button></div>
 </div>
 <div class="msg" id="msg"></div>
-<h2 style="margin-top:18px;font-size:14px">이 날의 예약 목록</h2>
-<table><thead><tr><th>시간</th><th>회의실</th><th>예약자</th><th>회의 목적</th><th></th></tr></thead><tbody id="resList"><tr><td colspan="5" class="muted">예약 없음</td></tr></tbody></table>
+</div>
+</div>
+</div>
+
+<div id="viewSettings" class="card" hidden>
+<h2>⚙ 설정 — 층 / 회의실 기본 정보</h2>
+<h3 style="font-size:14px;margin:6px 0">층 목록</h3>
+<div class="chips" id="floorChips"></div>
+<div class="row"><input type="text" id="newFloor" placeholder="예: 8층" style="max-width:160px"><button class="sec" onclick="addFloor()">층 추가</button></div>
+<h3 style="font-size:14px;margin:18px 0 6px">회의실 기본 정보</h3>
+<p class="muted" style="margin:0 0 8px">카메라 기기·예약에 등장한 회의실은 자동으로 나타납니다. 층을 지정하면 해당 층 탭에 표시됩니다.</p>
+<div style="overflow-x:auto"><table class="cfgtable"><thead><tr><th>회의실명</th><th>층</th><th title="접속 시 이 회의실의 층 탭이 자동으로 열립니다">자주 이용하는 회의실</th><th>TV</th><th>의자 수</th><th>테이블 수</th><th>화이트보드</th><th>화상회의 장비</th><th>비고</th><th></th></tr></thead><tbody id="cfgRooms"></tbody></table></div>
+<div class="row" style="margin-top:10px"><input type="text" id="newRoom" placeholder="회의실명 직접 추가" style="max-width:220px"><button class="sec" onclick="addRoomRow()">회의실 추가</button></div>
+<p class="muted" style="margin:8px 0 0">자주 이용하는 회의실: 표에서 하나를 선택하면 접속 시 그 회의실의 층 탭이 자동으로 열리고 그 회의실이 선택됩니다. <a href="#" onclick="cfgEdit.favorite='';renderSettings();return false">선택 해제</a></p>
+<div class="row" style="margin-top:16px"><button onclick="saveConfig()">설정 저장</button><span class="msg" id="cfgMsg" style="margin:0"></span></div>
 </div>
 </main>
+
+<div id="editModal" class="modal" hidden>
+ <div class="modal-box">
+  <h2>예약 수정</h2>
+  <div class="grid">
+   <div><label>회의실</label><input type="text" id="eRoom" disabled></div>
+   <div><label>날짜</label><input type="date" id="eDate"></div>
+   <div><label>시작</label><select id="eStart"></select></div>
+   <div><label>종료</label><select id="eEnd"></select></div>
+   <div><label>예약자명</label><input type="text" id="eReserver"></div>
+   <div><label>회의 목적</label><input type="text" id="ePurpose"></div>
+  </div>
+  <div class="msg" id="eMsg"></div>
+  <div class="row" style="margin-top:12px;justify-content:flex-end"><button class="bad" onclick="deleteFromEdit()">예약 삭제</button><span class="sp" style="flex:1"></span><button class="sec" onclick="closeEdit()">취소</button><button onclick="confirmEdit()">수정 확인</button></div>
+ </div>
+</div>
 <script>
 const OPEN={{ open_hour }}, CLOSE={{ close_hour }}, STEP={{ slot_min }};
 const SERVER_BLUR={{ 'true' if server_blur else 'false' }};
@@ -866,6 +1022,7 @@ const pct=slots=>(slots/NSLOTS*100)+'%';   // 칸 수 -> 가로 위치/폭 (%). 
 const hhmm=m=>String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');
 const slotMin=i=>OPEN*60+i*STEP;
 let reservations=[], selStart=-1, selEnd=-1, dragging=false, rooms=[];
+let config={floors:[],rooms:{},favorite:''}, currentTab='all', editId=null, startedAtFavorite=false, loadedOnce=false;
 
 // ---- 시간 눈금 / 칸 생성 ----
 (function build(){
@@ -873,7 +1030,7 @@ let reservations=[], selStart=-1, selEnd=-1, dragging=false, rooms=[];
   for(let i=0;i<=NSLOTS;i++){const s=document.createElement('span');s.style.left=pct(i);s.textContent=hhmm(slotMin(i));if(slotMin(i)%60!==0)s.className='half';else if((slotMin(i)/60-OPEN)%3===0)s.className='h3';hours.appendChild(s)}
   const slots=$('tlSlots');
   for(let i=0;i<NSLOTS;i++){const d=document.createElement('div');d.className='slot';d.dataset.i=i;d.innerHTML='<small>'+hhmm(slotMin(i))+'</small>';slots.appendChild(d)}
-  for(let i=0;i<=NSLOTS;i++){const o1=new Option(hhmm(slotMin(i)),hhmm(slotMin(i)));const o2=new Option(hhmm(slotMin(i)),hhmm(slotMin(i)));if(i<NSLOTS)$('start').add(o1);if(i>0)$('end').add(o2)}
+  for(let i=0;i<=NSLOTS;i++){const t=hhmm(slotMin(i));if(i<NSLOTS){$('start').add(new Option(t,t));$('eStart').add(new Option(t,t))}if(i>0){$('end').add(new Option(t,t));$('eEnd').add(new Option(t,t))}}
   $('start').onchange=()=>{selStart=Math.max(0,($('start').value.split(':')[0]*60+ +$('start').value.split(':')[1]-OPEN*60)/STEP);if($('end').selectedIndex<selStart+0)$('end').selectedIndex=selStart;selEnd=$('end').selectedIndex;paintSel()};
   $('end').onchange=()=>{selEnd=$('end').selectedIndex;if(selEnd<selStart)selEnd=selStart;paintSel()};
 })();
@@ -926,7 +1083,7 @@ async function moveRes(id,start,end){   // 서버에 시간 변경 요청. 성�
   if(!j.ok)throw new Error(j.error||'변경 실패');return true}
 async function endDrag(){if(!drag)return;const d=drag;drag=null;d.el.classList.remove('dragging','moving','resizing');hideTip();
   const m=$('msg');
-  if(!d.moved||(d.s===d.s0&&d.e===d.e0)){m.className='msg';m.textContent='';render();return}
+  if(!d.moved||(d.s===d.s0&&d.e===d.e0)){m.className='msg';m.textContent='';if(d.s!==d.s0||d.e!==d.e0)render();return}
   const s=slotMin(d.s),e=slotMin(d.e),hit=overlapWith(d.id,s,e);
   if(hit){render();m.className='msg bad';m.textContent='기존 예약과 겹쳐서 변경되지 않았습니다: '+resLabel(hit);
     alert('기존 예약과 겹칩니다.\n\n  '+resLabel(hit)+'\n\n'+d.res.reserver+' 예약은 '+d.res.start+'~'+d.res.end+' 그대로 유지됩니다.');return}
@@ -936,10 +1093,16 @@ async function endDrag(){if(!drag)return;const d=drag;drag=null;d.el.classList.r
     const u=document.createElement('button');u.className='sm sec';u.textContent='되돌리기';u.onclick=async()=>{try{await moveRes(d.id,d.res.start,d.res.end);m.className='msg';m.textContent='원래 시간('+d.res.start+'~'+d.res.end+')으로 되돌렸습니다'}catch(err){alert(err.message)}loadReservations();loadRooms()};m.appendChild(u)}
   catch(err){render();m.className='msg bad';m.textContent='변경 실패: '+err.message;alert('변경할 수 없습니다.\n\n'+err.message)}
   loadReservations();loadRooms()}
-$('tlRes').addEventListener('mousedown',e=>{if(e.button!==0)return;const el=e.target.closest('.res');if(!el||e.target.closest('.x'))return;beginDrag(el,e.clientX,pickMode(el,e.target,e.clientX));e.preventDefault()});
+let lastPress={id:null,t:0};
+function isDoublePress(id){const now=Date.now();const dbl=lastPress.id===id&&now-lastPress.t<400;lastPress={id:dbl?null:id,t:now};return dbl}
+$('tlRes').addEventListener('mousedown',e=>{if(e.button!==0)return;const el=e.target.closest('.res');if(!el||e.target.closest('.x'))return;
+  if(isDoublePress(el.dataset.id)){if(drag){drag=null;el.classList.remove('dragging','moving','resizing');hideTip()}openEdit(el.dataset.id);e.preventDefault();return}   // 더블클릭 -> 수정 창
+  beginDrag(el,e.clientX,pickMode(el,e.target,e.clientX));e.preventDefault()});
 window.addEventListener('mousemove',e=>{if(drag)moveDrag(e.clientX)});
 window.addEventListener('mouseup',()=>{if(drag)endDrag()});
-$('tlRes').addEventListener('touchstart',e=>{const el=e.target.closest('.res');if(!el||e.target.closest('.x'))return;const x=e.touches[0].clientX;beginDrag(el,x,pickMode(el,e.target,x));e.preventDefault()},{passive:false});
+$('tlRes').addEventListener('touchstart',e=>{const el=e.target.closest('.res');if(!el||e.target.closest('.x'))return;
+  if(isDoublePress(el.dataset.id)){if(drag){drag=null;el.classList.remove('dragging','moving','resizing');hideTip()}openEdit(el.dataset.id);e.preventDefault();return}
+  const x=e.touches[0].clientX;beginDrag(el,x,pickMode(el,e.target,x));e.preventDefault()},{passive:false});
 window.addEventListener('touchmove',e=>{if(drag){moveDrag(e.touches[0].clientX);e.preventDefault()}},{passive:false});
 window.addEventListener('touchend',()=>{if(drag)endDrag()});
 // ✕ 버튼: 예약 취소
@@ -957,14 +1120,15 @@ function syncForm(){if(selStart<0)return;$('start').value=hhmm(slotMin(selStart)
 // ---- 데이터 ----
 async function loadRooms(){
   const j=await(await fetch('/api/rooms',{cache:'no-store'})).json();rooms=j.rooms;
-  const names=(await(await fetch('/api/room-names')).json()).rooms;
+  const camRooms=rooms.map(r=>r.room);   // 카메라가 있는 회의실을 먼저, 나머지는 이름순
+  const names=(await(await fetch('/api/room-names')).json()).rooms.filter(inTab).sort((a,b)=>(camRooms.includes(b)-camRooms.includes(a))||a.localeCompare(b,'ko'));
   const sel=$('room'),cur=sel.value;sel.innerHTML='';names.forEach(n=>sel.add(new Option(n,n)));
   if(names.includes(cur))sel.value=cur;else if(names.length)sel.value=names[0];
-  if(sel.value!==cur)loadReservations();
-  const box=$('rooms');
-  if(!rooms.length){box.innerHTML='<div class="muted">인증된 카메라가 아직 없습니다. 기기에서 인증코드를 입력하면 여기에 표시됩니다.</div>';return}
+  if(sel.value!==cur||!loadedOnce){loadedOnce=true;loadReservations()}else renderInfo();
+  const box=$('rooms');const shown=rooms.filter(r=>inTab(r.room));
+  if(!shown.length){box.innerHTML='<div class="muted">'+(rooms.length?'이 층에 카메라가 등록된 회의실이 없습니다. ⚙ 설정에서 회의실의 층을 지정하세요.':'인증된 카메라가 아직 없습니다. 기기에서 인증코드를 입력하면 여기에 표시됩니다.')+'</div>';$('roomsNote').textContent='· '+j.server_time;return}
   const t=Date.now();
-  box.innerHTML=rooms.map(r=>{
+  box.innerHTML=shown.map(r=>{
     const st=!r.online?'<span class="badge">오프라인</span>':r.occupied?'<span class="badge ok">재실 ('+(r.occupied_by_server?'서버 검출 ':'')+r.faces+'명)</span>':'<span class="badge warn">비어있음</span>';
     const cr=r.current_reservation;
     let note='';
@@ -977,12 +1141,18 @@ async function loadRooms(){
      +'<div class="muted">'+(cr?'현재 예약: '+cr.start+'~'+cr.end+' '+esc(cr.reserver)+' · '+esc(cr.purpose):'현재 예약 없음')+(note?' &nbsp;|&nbsp; '+note:'')+'</div>'+warn
      +'<div class="muted">'+esc(r.ip)+' · 갱신 '+(r.last_heartbeat_ago==null?'-':r.last_heartbeat_ago+'초 전')+(r.rssi?' · '+r.rssi+' dBm':'')+'</div>'
      +'<div class="row"><a href="'+r.stream_url+'" target="_blank"><button class="sm sec" type="button">실시간 영상</button></a><a href="'+r.device_url+'" target="_blank"><button class="sm sec" type="button">기기 페이지</button></a><button class="sm" onclick="pickRoom(\''+esc(r.room)+'\')">예약하기</button></div></div></div>'}).join('');
-  $('roomsNote').textContent='· '+j.server_time;
+  $('roomsNote').textContent='· '+j.server_time;fitCols();
 }
+function fitCols(){}   // 왼쪽 카드 높이는 grid 가 오른쪽(정보/목록 + 예약) 블록 높이에 맞춰 늘림
 function pickRoom(n){$('room').value=n;loadReservations();window.scrollTo({top:$('room').getBoundingClientRect().top+window.scrollY-80,behavior:'smooth'})}
-async function loadReservations(){
+// 날짜를 "2026.09.20.일" 형식으로 표시 (input[type=date] 는 표시 형식을 바꿀 수 없어 텍스트로 대신 보여줌)
+function updateDow(){const v=$('date').value;const box=$('dateText').parentElement;if(!v){$('dateText').textContent='';return}
+  const p=v.split('-');const d=new Date(+p[0],+p[1]-1,+p[2]);const n=['일','월','화','수','목','금','토'][d.getDay()];
+  $('dateText').textContent=p[0]+'.'+p[1]+'.'+p[2]+'.'+n;box.className='datebox'+(d.getDay()===0?' sun':d.getDay()===6?' sat':'')}
+async function loadReservations(){updateDow();
   const room=$('room').value,d=$('date').value;
   document.querySelectorAll('.room').forEach(el=>el.classList.toggle('selected',el.querySelector('.name')?.textContent===room));
+  renderInfo();$('listNote').textContent=room?'· '+room+' · '+$('dateText').textContent:'';
   if(!room){reservations=[];render();return}
   const j=await(await fetch('/api/reservations?room='+encodeURIComponent(room)+'&date='+d,{cache:'no-store'})).json();
   reservations=j.reservations;render();
@@ -995,11 +1165,13 @@ function render(){
   document.querySelectorAll('.slot').forEach(s=>{const i=+s.dataset.i;s.classList.toggle('busy',isBusy(i));s.classList.toggle('past',isPast||(isToday&&slotMin(i)+STEP<=nowMin))});
   $('tlRes').innerHTML=reservations.map(r=>{const l=(toMin(r.start)-OPEN*60)/STEP,w=(toMin(r.end)-toMin(r.start))/STEP;
     const cur=isToday&&toMin(r.start)<=nowMin&&nowMin<toMin(r.end);
-    return '<div class="res'+(cur?' now':'')+'" data-id="'+r.id+'" style="left:calc('+pct(l)+' + 2px);width:calc('+pct(w)+' - 4px)" title="가운데: 이동 / 양끝: 시간 조절 · '+esc(r.purpose)+'"><b>'+esc(r.reserver)+'</b><span class="t">'+r.start+'~'+r.end+'</span><span>'+esc(r.purpose)+'</span><span class="x" title="예약 취소">✕</span><span class="h hl" title="시작 시간 조절"></span><span class="h hr" title="종료 시간 조절"></span></div>'}).join('');
+    const past=isPast||(isToday&&toMin(r.end)<=nowMin);   // 끝난 예약은 옅은 회색
+    return '<div class="res'+(cur?' now':'')+(past?' past':'')+'" data-id="'+r.id+'" style="left:calc('+pct(l)+' + 2px);width:calc('+pct(w)+' - 4px)" title="가운데: 이동 / 양끝: 시간 조절 · '+esc(r.purpose)+'"><b>'+esc(r.reserver)+'</b><span class="t">'+r.start+'~'+r.end+'</span><span>'+esc(r.purpose)+'</span><span class="x" title="예약 취소">✕</span><span class="h hl" title="시작 시간 조절"></span><span class="h hr" title="종료 시간 조절"></span></div>'}).join('');
   const nowEl=$('tlNow');
   if(isToday&&nowMin>=OPEN*60&&nowMin<=CLOSE*60){nowEl.style.display='';nowEl.style.left=pct((nowMin-OPEN*60)/STEP)}else nowEl.style.display='none';
   paintSel();
-  $('resList').innerHTML=reservations.length?reservations.map(r=>'<tr><td>'+r.start+' ~ '+r.end+'</td><td>'+esc(r.room)+'</td><td>'+esc(r.reserver)+'</td><td>'+esc(r.purpose)+'</td><td><button class="sm bad" onclick="delRes(\''+r.id+'\')">취소</button></td></tr>').join(''):'<tr><td colspan="5" class="muted">예약 없음</td></tr>';
+  $('resList').innerHTML=reservations.length?reservations.map(r=>{const past=isPast||(isToday&&toMin(r.end)<=nowMin);const cur=isToday&&toMin(r.start)<=nowMin&&nowMin<toMin(r.end);
+    return '<tr'+(past?' class="past"':cur?' class="now"':'')+'><td style="white-space:nowrap">'+r.start+' ~ '+r.end+(cur?'<span class="badge ok">진행중</span>':'')+'</td><td>'+esc(r.reserver)+'</td><td>'+esc(r.purpose)+'</td><td style="white-space:nowrap"><button class="sm sec" onclick="openEdit(\''+r.id+'\')">수정</button> <button class="sm bad" onclick="delRes(\''+r.id+'\')">취소</button></td></tr>'}).join(''):'<tr><td colspan="4" class="muted">예약 없음</td></tr>';
 }
 async function reserve(){
   const m=$('msg');m.className='msg';m.textContent='';
@@ -1019,9 +1191,100 @@ function shiftDate(n){const p=($('date').value||ymd(new Date())).split('-');cons
 function setToday(){$('date').value=ymd(new Date());selStart=selEnd=-1;loadReservations()}
 $('room').onchange=()=>{selStart=selEnd=-1;loadReservations()};
 $('date').onchange=()=>{selStart=selEnd=-1;loadReservations()};
+
+// ---- 탭 (전체 / 층 / 설정) ----
+const inTab=name=>currentTab==='all'||(config.rooms[name]||{}).floor===currentTab;
+async function loadConfig(){try{config=await(await fetch('/api/config',{cache:'no-store'})).json()}catch(e){}
+  if(!startedAtFavorite){startedAtFavorite=true;const fav=config.favorite;
+    if(fav&&config.rooms[fav]){const fl=config.rooms[fav].floor;currentTab=(fl&&config.floors.includes(fl))?fl:'all';$('room').innerHTML='';$('room').add(new Option(fav,fav));$('room').value=fav}}
+  renderTabs()}
+function renderTabs(){const t=$('tabs');const tabs=[['all','전체'],...config.floors.map(f=>[f,f]),['settings','⚙ 설정']];
+  if(!tabs.some(x=>x[0]===currentTab))currentTab='all';
+  t.innerHTML=tabs.map(([id,label])=>(id==='settings'?'<div class="tabclock" id="tabClock"></div>':'')+'<div class="tab'+(id===currentTab?' active':'')+(id==='settings'?' cfg':'')+'" data-tab="'+esc(id)+'">'+esc(label)+'</div>').join('');tick();
+  t.querySelectorAll('.tab').forEach(el=>el.onclick=()=>setTab(el.dataset.tab))}
+function setTab(id){currentTab=id;renderTabs();const st=id==='settings';$('viewSettings').hidden=!st;$('viewRooms').style.display=st?'none':'';
+  if(st)renderSettings();else{$('room').value='';loadRooms()}}
+
+// ---- 가운데: 회의실 기본 정보 ----
+function renderInfo(){const name=$('room').value;$('infoName').textContent=name?'· '+name:'';const box=$('roomInfo');
+  if(!name){box.className='muted';box.textContent='회의실을 선택하세요';return}
+  const i=config.rooms[name]||{};const cam=rooms.find(r=>r.room===name);
+  const yn=v=>v?'<span class="yes">있음</span>':'<span class="no">없음</span>';
+  let st='<span class="no">카메라 없음</span>';
+  if(cam)st=!cam.online?'<span class="badge">오프라인</span>':cam.occupied?'<span class="badge ok">재실 ('+cam.faces+'명)</span>':'<span class="badge warn">비어있음</span>';
+  const cr=cam&&cam.current_reservation;
+  box.className='';box.innerHTML='<dl class="info">'
+   +'<dt>층</dt><dd>'+(i.floor?esc(i.floor):'<span class="no">미지정</span>')+'</dd>'
+   +'<dt>TV</dt><dd>'+yn(i.tv)+'</dd>'
+   +'<dt>의자 수</dt><dd>'+(i.chairs||0)+'개</dd>'
+   +'<dt>테이블 수</dt><dd>'+(i.tables||0)+'개</dd>'
+   +'<dt>화이트보드</dt><dd>'+yn(i.whiteboard)+'</dd>'
+   +'<dt>화상회의 장비</dt><dd>'+yn(i.vc)+'</dd>'
+   +'<dt>비고</dt><dd>'+(i.note?esc(i.note):'<span class="no">-</span>')+'</dd>'
+   +'<dt>현재 상태</dt><dd>'+st+'</dd>'
+   +'<dt>현재 예약</dt><dd>'+(cr?cr.start+'~'+cr.end+' '+esc(cr.reserver)+' ('+esc(cr.purpose)+')':'<span class="no">없음</span>')+'</dd>'
+   +'</dl><p class="muted" style="margin:12px 0 0"><a href="#" onclick="setTab(\'settings\');return false">⚙ 설정에서 정보 수정</a></p>'}
+
+// ---- 예약 수정 모달 (막대 더블클릭 / 목록의 [수정]) ----
+function openEdit(id){const r=reservations.find(x=>x.id===id);if(!r)return;editId=id;
+  $('eRoom').value=r.room;$('eDate').value=r.date;$('eStart').value=r.start;$('eEnd').value=r.end;$('eReserver').value=r.reserver;$('ePurpose').value=r.purpose;
+  $('eMsg').className='msg';$('eMsg').textContent='';$('editModal').hidden=false;$('eReserver').focus()}
+function closeEdit(){$('editModal').hidden=true;editId=null}
+async function confirmEdit(){if(!editId)return;const m=$('eMsg');m.className='msg';m.textContent='';
+  const body={date:$('eDate').value,start:$('eStart').value,end:$('eEnd').value,reserver:$('eReserver').value.trim(),purpose:$('ePurpose').value.trim()};
+  if(toMin(body.start)>=toMin(body.end)){m.className='msg bad';m.textContent='종료 시간은 시작 시간보다 늦어야 합니다';return}
+  if(!body.reserver||!body.purpose){m.className='msg bad';m.textContent='예약자명과 회의 목적을 입력하세요';return}
+  try{const r=await fetch('/api/reservations/'+editId,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();
+    if(!j.ok){m.className='msg bad';m.textContent=j.error||'수정 실패';return}
+    closeEdit();const mm=$('msg');mm.className='msg ok';mm.textContent='예약을 수정했습니다: '+body.date+' '+body.start+'~'+body.end+' '+body.reserver;
+    if(body.date!==$('date').value){$('date').value=body.date}   // 날짜를 옮겼으면 그 날짜로 이동
+    loadReservations();loadRooms()}
+  catch(e){m.className='msg bad';m.textContent='요청 실패: '+e}}
+async function deleteFromEdit(){if(!editId)return;const r=reservations.find(x=>x.id===editId);
+  if(confirm((r?r.start+'~'+r.end+' '+r.reserver+'\n':'')+'이 예약을 삭제할까요?')){const id=editId;closeEdit();delRes(id)}}
+$('tlRes').addEventListener('dblclick',e=>{const el=e.target.closest('.res');if(el)openEdit(el.dataset.id)});
+$('editModal').addEventListener('click',e=>{if(e.target===$('editModal'))closeEdit()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('editModal').hidden)closeEdit()});
+
+// ---- 설정 탭: 층 / 회의실 기본 정보 ----
+let cfgEdit=null;   // 편집 중인 사본
+function renderSettings(){if(!cfgEdit)cfgEdit=JSON.parse(JSON.stringify(config));
+  $('floorChips').innerHTML=cfgEdit.floors.length?cfgEdit.floors.map((f,i)=>'<span class="chip">'+esc(f)+'<b title="삭제" onclick="removeFloor('+i+')">✕</b></span>').join(''):'<span class="muted">등록된 층이 없습니다</span>';
+  const opts=f=>'<option value="">미지정</option>'+cfgEdit.floors.map(x=>'<option'+(x===f?' selected':'')+'>'+esc(x)+'</option>').join('');
+  const names=Object.keys(cfgEdit.rooms).sort();
+  $('cfgRooms').innerHTML=names.length?names.map(n=>{const i=cfgEdit.rooms[n];const d='data-n="'+esc(n)+'"';
+    return '<tr><td><b>'+esc(n)+'</b></td>'
+     +'<td><select '+d+' data-k="floor">'+opts(i.floor)+'</select></td>'
+     +'<td><input type="radio" name="fav" value="'+esc(n)+'"'+(cfgEdit.favorite===n?' checked':'')+' onchange="cfgEdit.favorite=this.value" title="자주 이용하는 회의실로 지정"></td>'
+     +'<td><input type="checkbox" '+d+' data-k="tv"'+(i.tv?' checked':'')+'></td>'
+     +'<td><input type="number" min="0" '+d+' data-k="chairs" value="'+(i.chairs||0)+'"></td>'
+     +'<td><input type="number" min="0" '+d+' data-k="tables" value="'+(i.tables||0)+'"></td>'
+     +'<td><input type="checkbox" '+d+' data-k="whiteboard"'+(i.whiteboard?' checked':'')+'></td>'
+     +'<td><input type="checkbox" '+d+' data-k="vc"'+(i.vc?' checked':'')+'></td>'
+     +'<td><input type="text" '+d+' data-k="note" value="'+esc(i.note||'')+'"></td>'
+     +'<td><button class="sm sec" onclick="removeRoomRow(\''+esc(n)+'\')">삭제</button></td></tr>'}).join(''):'<tr><td colspan="10" class="muted">회의실이 없습니다. 아래에서 추가하세요</td></tr>';
+  $('cfgRooms').querySelectorAll('[data-k]').forEach(el=>el.onchange=()=>{const i=cfgEdit.rooms[el.dataset.n];if(!i)return;const k=el.dataset.k;
+    i[k]=el.type==='checkbox'?el.checked:el.type==='number'?Math.max(0,+el.value||0):el.value})}
+function addFloor(){const v=$('newFloor').value.trim();if(!v)return;if(cfgEdit.floors.includes(v)){alert('이미 있는 층입니다');return}cfgEdit.floors.push(v);$('newFloor').value='';renderSettings()}
+function removeFloor(i){const f=cfgEdit.floors[i];if(!confirm("'"+f+"' 층을 삭제할까요? 이 층에 속한 회의실은 '미지정'이 됩니다"))return;
+  cfgEdit.floors.splice(i,1);Object.values(cfgEdit.rooms).forEach(r=>{if(r.floor===f)r.floor=''});renderSettings()}
+function addRoomRow(){const v=$('newRoom').value.trim();if(!v)return;if(cfgEdit.rooms[v]){alert('이미 있는 회의실입니다');return}
+  cfgEdit.rooms[v]={floor:'',tv:false,chairs:0,tables:0,whiteboard:false,vc:false,note:''};$('newRoom').value='';renderSettings()}
+function removeRoomRow(n){if(!confirm("'"+n+"' 의 기본 정보를 삭제할까요? (카메라/예약이 있으면 이름은 계속 표시됩니다)"))return;delete cfgEdit.rooms[n];renderSettings()}
+async function saveConfig(){const m=$('cfgMsg');m.className='msg';m.textContent='저장 중...';
+  try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfgEdit)});const j=await r.json();
+    if(!j.ok){m.className='msg bad';m.textContent=j.error||'저장 실패';return}
+    m.className='msg ok';m.textContent='저장했습니다';await loadConfig();cfgEdit=null;renderSettings()}
+  catch(e){m.className='msg bad';m.textContent='요청 실패: '+e}}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-setInterval(()=>{$('clock').textContent=new Date().toLocaleString('ko-KR')},1000);
-loadRooms();setInterval(loadRooms,4000);setInterval(render,60000);
+function tick(){const n=new Date();$('clock').textContent=n.toLocaleString('ko-KR');const c=$('tabClock');if(!c)return;
+  const dn=['일','월','화','수','목','금','토'][n.getDay()];const hh=String(n.getHours()).padStart(2,'0'),mm=String(n.getMinutes()).padStart(2,'0'),ss=String(n.getSeconds()).padStart(2,'0');
+  const tEl=c.querySelector('.time');
+  if(tEl&&c.dataset.d===ymd(n)){tEl.textContent=hh+':'+mm+':'+ss;return}   // 날짜가 같으면 시간 글자만 갱신
+  c.dataset.d=ymd(n);
+  c.innerHTML='<span class="date">'+ymd(n).replace(/-/g,'.')+'.<span class="dow'+(n.getDay()===0?' sun':'')+'">'+dn+'</span></span><span class="sep">|</span><span class="time">'+hh+':'+mm+':'+ss+'</span>'}
+setInterval(tick,1000);
+loadConfig().then(loadRooms);setInterval(()=>{if(currentTab!=='settings')loadRooms()},4000);setInterval(render,60000);
 </script></body></html>"""
 
 

@@ -1,0 +1,28 @@
+{
+  "floors": [
+    "8층",
+    "9층",
+    "11층"
+  ],
+  "rooms": {
+    "11층 회의실": {
+      "floor": "11층",
+      "tv": true,
+      "chairs": 10,
+      "tables": 2,
+      "whiteboard": true,
+      "vc": true,
+      "note": ""
+    },
+    "9층 소회의실1": {
+      "floor": "9층",
+      "tv": true,
+      "chairs": 6,
+      "tables": 1,
+      "whiteboard": true,
+      "vc": true,
+      "note": ""
+    }
+  },
+  "favorite": "11층 회의실"
+}
